@@ -5,6 +5,12 @@ use super::{
     TOKEN_TREND_LOOKBACK_MS,
 };
 
+pub const MIN_LEFT_S: f64 = 25.0;
+pub const MIN_TOKEN_ASK: f64 = 0.12;
+pub const MAX_TOKEN_ASK_GATE: f64 = 0.88;
+pub const MIN_ASK_ROOM: f64 = 0.15;
+pub const MAX_ABS_Z: f64 = 1.5;
+
 #[derive(Clone, Debug)]
 pub struct CaptureGateInput {
     pub direction: Side,
@@ -12,6 +18,7 @@ pub struct CaptureGateInput {
     pub seconds_left: f64,
     pub sigma_rem: f64,
     pub token_ask: f64,
+    pub impulse_usd: f64,
     pub expected_dp: f64,
     pub book_lag: f64,
 }
@@ -141,20 +148,71 @@ pub fn sigma_remaining(seconds_left: f64) -> f64 {
     77.4
 }
 
-/// Simplified fair-P gate from trendCapture evaluateCaptureGate.
+/// Mirrors poly-prices `evaluateCaptureGate`.
+pub fn evaluate_capture_gate(
+    direction: Side,
+    gap_usd: f64,
+    impulse_usd: f64,
+    seconds_left: f64,
+    sigma_rem: f64,
+    token_ask: f64,
+) -> CaptureGateResult {
+    let sigma = sigma_rem.max(4.0);
+    let z = gap_usd / sigma;
+    let p0 = normal_cdf(z);
+    let p1 = normal_cdf((gap_usd + impulse_usd) / sigma);
+    let dp = p1 - p0;
+    let expected_dp = dp.abs();
+    let fair_p = match direction {
+        Side::Up => p1,
+        Side::Down => 1.0 - p1,
+    };
+    let book_lag = fair_p - token_ask;
+    let room = 1.0 - token_ask;
+    let min_dp = min_expected_dp_for_ask(token_ask);
+    let dp_sign_ok = match direction {
+        Side::Up => dp > 0.0,
+        Side::Down => dp < 0.0,
+    };
+    let ok = seconds_left >= MIN_LEFT_S
+        && token_ask < MAX_TOKEN_ASK_GATE
+        && token_ask >= MIN_TOKEN_ASK
+        && room >= MIN_ASK_ROOM
+        && z.abs() <= MAX_ABS_Z
+        && dp_sign_ok
+        && expected_dp >= min_dp
+        && expected_dp <= room * 0.9;
+    CaptureGateResult {
+        ok,
+        expected_dp,
+        book_lag,
+        fair_p,
+    }
+}
+
+pub fn min_expected_dp_for_ask(token_ask: f64) -> f64 {
+    0.014 + 0.09 * token_ask
+}
+
+#[derive(Clone, Debug)]
+pub struct CaptureGateResult {
+    pub ok: bool,
+    pub expected_dp: f64,
+    pub book_lag: f64,
+    pub fair_p: f64,
+}
+
+/// Gate for START emission — mirrors `evaluateCaptureGate` (not minBookLag; that's in pairing).
 pub fn capture_gate_ok(input: &CaptureGateInput) -> bool {
-    if input.token_ask >= 0.88 || input.token_ask < 0.12 {
-        return false;
-    }
-    if input.book_lag < 0.015 {
-        return false;
-    }
-    let z = input.gap_usd / input.sigma_rem.max(1e-6);
-    if z.abs() > 1.5 {
-        return false;
-    }
-    let min_dp = 0.014 + 0.09 * input.token_ask;
-    input.expected_dp >= min_dp
+    evaluate_capture_gate(
+        input.direction,
+        input.gap_usd,
+        input.impulse_usd,
+        input.seconds_left,
+        input.sigma_rem,
+        input.token_ask,
+    )
+    .ok
 }
 
 pub fn fair_p(direction: Side, gap_usd: f64, sigma_rem: f64) -> f64 {

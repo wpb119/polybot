@@ -1,6 +1,6 @@
 //! Incremental BTC impulse START detector — mirrors poly-prices `trendCapture.rs`.
 
-use super::gates::{capture_gate_ok, fair_p, sigma_remaining, CaptureGateInput, Side};
+use super::gates::{evaluate_capture_gate, sigma_remaining, Side};
 use super::{
     BN_W, CB_W, COOLDOWN_MS, MAX_CAPTURES, MIN_NOW_FRAC, MIN_R1, MIN_SIGNED_ACC, Z_R1,
 };
@@ -118,7 +118,7 @@ impl TrendDetector {
     }
 
     pub fn push_poly(&mut self, t: i64, up: f64, down: f64) {
-        if up > 0.0 {
+        if up > 0.0 && down > 0.0 {
             self.poly.push((t, up, down));
         }
     }
@@ -222,21 +222,20 @@ impl TrendDetector {
         let seconds_left = ((self.end_ms - tick_t) as f64 / 1000.0).max(1.0);
         let gap_usd = n - self.strike.unwrap_or(n);
         let sigma_rem = sigma_remaining(seconds_left);
-        let (token_ask, book_lag, expected_dp) = self.token_metrics(tick_t, direction, gap_usd, sigma_rem, r1);
+        let (token_ask, impulse_usd) = self.token_ask_at(tick_t, direction);
         if token_ask <= 0.0 {
             return None;
         }
 
-        let gate_in = CaptureGateInput {
+        let gate = evaluate_capture_gate(
             direction,
             gap_usd,
+            impulse_usd,
             seconds_left,
             sigma_rem,
             token_ask,
-            expected_dp,
-            book_lag,
-        };
-        if !capture_gate_ok(&gate_in) {
+        );
+        if !gate.ok {
             return None;
         }
 
@@ -250,20 +249,13 @@ impl TrendDetector {
             token_ask,
             gap_usd,
             seconds_left,
-            book_lag,
-            expected_dp,
+            book_lag: gate.book_lag,
+            expected_dp: gate.expected_dp,
             tradable: true,
         })
     }
 
-    fn token_metrics(
-        &self,
-        t: i64,
-        direction: Side,
-        gap_usd: f64,
-        sigma_rem: f64,
-        impulse: f64,
-    ) -> (f64, f64, f64) {
+    fn token_ask_at(&self, t: i64, direction: Side) -> (f64, f64) {
         let mut token_ask = 0.0;
         for &(pt, up, down) in &self.poly {
             if pt > t {
@@ -274,9 +266,7 @@ impl TrendDetector {
                 Side::Down => down,
             };
         }
-        let fair = fair_p(direction, gap_usd, sigma_rem);
-        let book_lag = fair - token_ask;
-        let expected_dp = book_lag + impulse.abs() / 100.0; // simplified
-        (token_ask, book_lag, expected_dp)
+        let impulse = self.norm.usd_return(t, 1000);
+        (token_ask, impulse)
     }
 }

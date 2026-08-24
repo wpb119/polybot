@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -107,16 +107,29 @@ impl Bot {
             let trade_start = trading_window_start(now);
             if self.trading_start_ts != Some(trade_start) {
                 if let Some(old) = self.trading_start_ts {
-                    self.finalize_window(old, now);
+                    self.finalize_window(old, now).await;
                 }
                 if let Err(e) = self.start_trading_window(trade_start).await {
                     error!("start trading window: {:#}", e);
                 }
             }
 
+            let poly = self.poly_rx.borrow().clone();
+            if let Some(p) = poly {
+                if self.subscribed_starts.contains(&p.start_ts) {
+                    self.poly_book.push(p.start_ts, p.t, p.up_ask, p.down_ask);
+                }
+            }
+
             self.process_pending_dry(now);
 
             if self.can_trade(now) {
+                if let Some(m) = self.trading_market.clone() {
+                    if let Some(quotes) = self.poly_book.latest(m.start_ts) {
+                        self.detector.push_poly(quotes.t, quotes.up_ask, quotes.down_ask);
+                    }
+                }
+
                 let bn_q = self.bn_rx.borrow().clone();
                 if let Some(q) = bn_q {
                     if let Some(sig) = self.detector.on_bn(q.t, q.price) {
@@ -132,7 +145,6 @@ impl Bot {
 
                 if let Some(m) = self.trading_market.clone() {
                     if let Some(quotes) = self.poly_book.latest(m.start_ts) {
-                        self.detector.push_poly(quotes.t, quotes.up_ask, quotes.down_ask);
                         if let Some(action) =
                             self.engine.tick(now, quotes.up_ask, quotes.down_ask, m.end_ts * 1000)
                         {
@@ -140,12 +152,6 @@ impl Bot {
                         }
                     }
                 }
-            }
-
-            // Drain poly_rx into poly_book (all subscribed windows).
-            let poly = self.poly_rx.borrow().clone();
-            if let Some(p) = poly {
-                self.poly_book.push(p.start_ts, p.t, p.up_ask, p.down_ask);
             }
         }
     }
@@ -179,8 +185,31 @@ impl Bot {
             .map(|s| self.market_cache[s].clone())
             .collect();
 
+        let new_tokens = market_token_ids(&markets);
+        let old_markets: Vec<MarketInfo> = self
+            .subscribed_starts
+            .iter()
+            .filter_map(|s| self.market_cache.get(s).cloned())
+            .collect();
+        let old_tokens = market_token_ids(&old_markets);
+
         let labels: Vec<&str> = markets.iter().map(|m| m.slug.as_str()).collect();
-        info!("polymarket subscribe → {:?}", labels);
+
+        // Next window was pre-subscribed 5s early — at UTC open only drop expired tokens.
+        if !old_tokens.is_empty() && new_tokens.is_subset(&old_tokens) && new_tokens != old_tokens {
+            info!(
+                "window rolled — keep polymarket ws for {:?} (expired window unsubscribed logically)",
+                labels
+            );
+            self.subscribed_starts = desired;
+            return Ok(());
+        }
+
+        if markets.len() == 2 {
+            info!("polymarket pre-subscribe (5s before next open) → {:?}", labels);
+        } else {
+            info!("polymarket subscribe → {:?}", labels);
+        }
 
         self.subscribed_starts = desired.clone();
         self.subs_tx.send_replace(markets);
@@ -224,7 +253,21 @@ impl Bot {
         Ok(())
     }
 
-    fn finalize_window(&mut self, start_ts: i64, now: i64) {
+    async fn finalize_window(&mut self, start_ts: i64, now: i64) {
+        let end_ms = window_end_ms(start_ts);
+        if let Some(m) = self.trading_market.clone() {
+            if let Some(quotes) = self.poly_book.latest(start_ts) {
+                if let Some(action) =
+                    self.engine.tick(now, quotes.up_ask, quotes.down_ask, end_ms)
+                {
+                    self.execute_action(&action, &m, now).await;
+                }
+                if let Some(action) = self.engine.try_last_tick_flatten(end_ms) {
+                    self.execute_action(&action, &m, now).await;
+                }
+            }
+        }
+
         self.flush_dry_fills_for_window(start_ts);
 
         let quotes = self.poly_book.latest(start_ts);
@@ -408,4 +451,13 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+fn market_token_ids(markets: &[MarketInfo]) -> HashSet<String> {
+    let mut ids = HashSet::new();
+    for m in markets {
+        ids.insert(m.up_token_id.clone());
+        ids.insert(m.down_token_id.clone());
+    }
+    ids
 }

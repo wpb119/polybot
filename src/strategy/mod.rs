@@ -1,6 +1,7 @@
 //! Pairing strategy constants — mirrors poly-prices `captureSim.rs` defaults.
-//! Dry-run taker delay lives in `poly_book::TAKER_DELAY_MS`; live posts immediately.
+//! Dry-run: fill at send+TAKER_DELAY_MS. Live: post immediately (CLOB taker delay).
 
+pub const TAKER_DELAY_MS: i64 = 250;
 pub const PULLBACK: f64 = 0.04;
 pub const PULL_WAIT_MS: i64 = 4_000;
 pub const COOLDOWN_AFTER_EXIT_MS: i64 = 1_500;
