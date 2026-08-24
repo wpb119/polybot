@@ -1,0 +1,29 @@
+[package]
+name = "polybot"
+version = "0.1.0"
+edition = "2021"
+description = "Live Polymarket BTC 5m Pairing strategy bot"
+
+[dependencies]
+anyhow = "1"
+dotenvy = "0.15"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rust_decimal = { version = "1", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+# Polymarket CLOB v2 (order signing + REST)
+polymarket_client_sdk_v2 = { version = "0.7", features = ["clob"] }
+alloy = { version = "1.8", default-features = false, features = ["signers", "signer-local"] }
+uuid = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
