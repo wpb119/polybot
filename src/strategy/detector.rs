@@ -117,10 +117,6 @@ impl TrendDetector {
         self.strike
     }
 
-    pub fn end_ms(&self) -> i64 {
-        self.end_ms
-    }
-
     pub fn push_poly(&mut self, t: i64, up: f64, down: f64) {
         if up > 0.0 {
             self.poly.push((t, up, down));

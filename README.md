@@ -34,7 +34,6 @@ LIVE_TRADING=true
 POLYMARKET_PRIVATE_KEY=0x...
 POLYMARKET_FUNDER=0x...          # proxy wallet if using browser/Magic login
 POLYMARKET_SIGNATURE_TYPE=2      # 2 = GNOSIS_SAFE / browser proxy
-MAX_ORDER_USD=50
 ORDER_SHARES=10
 ```
 

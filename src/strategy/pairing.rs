@@ -41,7 +41,6 @@ pub enum BotAction {
 enum State {
     Idle,
     PendingEntry {
-        signal_t: i64,
         side: PositionSide,
         ref_ask: f64,
         deadline: i64,
@@ -81,7 +80,7 @@ impl PairingEngine {
         }
     }
 
-    pub fn on_signal(&mut self, sig: &CaptureSignal, now_ms: i64) -> Option<BotAction> {
+    pub fn on_signal(&mut self, sig: &CaptureSignal, _now_ms: i64) -> Option<BotAction> {
         if !sig.tradable {
             return None;
         }
@@ -112,7 +111,6 @@ impl PairingEngine {
         match &self.state {
             State::Idle => {
                 self.state = State::PendingEntry {
-                    signal_t: sig.t,
                     side: sig.direction.into(),
                     ref_ask: sig.token_ask,
                     deadline: sig.t + PULL_WAIT_MS,

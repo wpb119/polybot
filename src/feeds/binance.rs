@@ -1,9 +1,9 @@
 use std::time::Duration;
 
 use anyhow::Result;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::StreamExt;
 use tokio::sync::watch;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::connect_async;
 use tracing::{error, info, warn};
 
 const BINANCE_WS: &str = "wss://stream.binance.com:9443/ws/btcusdt@bookTicker";
@@ -32,7 +32,7 @@ pub fn spawn_binance() -> watch::Receiver<Option<BtcQuote>> {
 async fn run(tx: &watch::Sender<Option<BtcQuote>>) -> Result<()> {
     let (ws, _) = connect_async(BINANCE_WS).await?;
     info!("binance connected");
-    let (mut write, mut read) = ws.split();
+    let (_write, mut read) = ws.split();
     backoff_reset();
 
     while let Some(msg) = read.next().await {

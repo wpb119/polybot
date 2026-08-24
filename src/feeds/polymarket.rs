@@ -17,15 +17,11 @@ pub struct PolyQuote {
     pub start_ts: i64,
     pub up_ask: f64,
     pub down_ask: f64,
-    pub up_bid: Option<f64>,
-    pub down_bid: Option<f64>,
-    pub market_slug: String,
 }
 
 struct TokenMeta {
     start_ts: i64,
     is_up: bool,
-    slug: String,
 }
 
 pub fn spawn_polymarket(
@@ -68,7 +64,6 @@ async fn run_session(
             TokenMeta {
                 start_ts: m.start_ts,
                 is_up: true,
-                slug: m.slug.clone(),
             },
         );
         token_map.insert(
@@ -76,7 +71,6 @@ async fn run_session(
             TokenMeta {
                 start_ts: m.start_ts,
                 is_up: false,
-                slug: m.slug.clone(),
             },
         );
         asset_ids.push(m.up_token_id.clone());
@@ -94,7 +88,7 @@ async fn run_session(
 
     let mut books: HashMap<i64, MarketBookState> = HashMap::new();
     for m in markets {
-        books.insert(m.start_ts, MarketBookState::new(&m.slug));
+        books.insert(m.start_ts, MarketBookState::new());
     }
 
     let active_key = subscription_key(markets);
@@ -120,9 +114,6 @@ async fn run_session(
                         start_ts: *start_ts,
                         up_ask: u,
                         down_ask: d,
-                        up_bid: state.up_bid,
-                        down_bid: state.down_bid,
-                        market_slug: state.slug.clone(),
                     }));
                 }
             }
@@ -142,21 +133,15 @@ fn subscription_key(markets: &[MarketInfo]) -> String {
 }
 
 struct MarketBookState {
-    slug: String,
     up_ask: Option<f64>,
     down_ask: Option<f64>,
-    up_bid: Option<f64>,
-    down_bid: Option<f64>,
 }
 
 impl MarketBookState {
-    fn new(slug: &str) -> Self {
+    fn new() -> Self {
         Self {
-            slug: slug.to_string(),
             up_ask: None,
             down_ask: None,
-            up_bid: None,
-            down_bid: None,
         }
     }
 }
@@ -184,14 +169,6 @@ fn apply_msg(
                     state.down_ask = best;
                 }
             }
-            if let Some(bids) = v.get("bids").and_then(|x| x.as_array()) {
-                let best = best_price(bids, false);
-                if meta.is_up {
-                    state.up_bid = best;
-                } else {
-                    state.down_bid = best;
-                }
-            }
         }
         "best_bid_ask" => {
             let asset = v.get("asset_id").and_then(|x| x.as_str()).unwrap_or("");
@@ -202,21 +179,12 @@ fn apply_msg(
             let meta = meta.unwrap();
             let state = books.get_mut(&meta.start_ts).expect("book state");
             let ask = v.get("best_ask").and_then(parse_f64);
-            let bid = v.get("best_bid").and_then(parse_f64);
             if meta.is_up {
                 if ask.is_some() {
                     state.up_ask = ask;
                 }
-                if bid.is_some() {
-                    state.up_bid = bid;
-                }
-            } else {
-                if ask.is_some() {
-                    state.down_ask = ask;
-                }
-                if bid.is_some() {
-                    state.down_bid = bid;
-                }
+            } else if ask.is_some() {
+                state.down_ask = ask;
             }
         }
         "price_change" => {
@@ -230,21 +198,12 @@ fn apply_msg(
                     let meta = meta.unwrap();
                     let state = books.get_mut(&meta.start_ts).expect("book state");
                     let ask = ch.get("best_ask").and_then(parse_f64);
-                    let bid = ch.get("best_bid").and_then(parse_f64);
                     if meta.is_up {
                         if ask.is_some() {
                             state.up_ask = ask;
                         }
-                        if bid.is_some() {
-                            state.up_bid = bid;
-                        }
-                    } else {
-                        if ask.is_some() {
-                            state.down_ask = ask;
-                        }
-                        if bid.is_some() {
-                            state.down_bid = bid;
-                        }
+                    } else if ask.is_some() {
+                        state.down_ask = ask;
                     }
                 }
             }

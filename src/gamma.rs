@@ -8,16 +8,10 @@ pub const GAMMA_BASE: &str = "https://gamma-api.polymarket.com";
 pub struct MarketInfo {
     pub slug: String,
     pub title: String,
-    pub condition_id: String,
     pub start_ts: i64,
     pub end_ts: i64,
     pub up_token_id: String,
     pub down_token_id: String,
-}
-
-pub fn window_start_ts(now_ms: i64) -> i64 {
-    let now_sec = now_ms / 1000;
-    (now_sec / WINDOW_SEC) * WINDOW_SEC
 }
 
 pub fn btc5m_slug(start_ts: i64) -> String {
@@ -27,16 +21,13 @@ pub fn btc5m_slug(start_ts: i64) -> String {
 #[derive(Clone, Debug, Deserialize)]
 struct GammaMarket {
     question: Option<String>,
-    #[serde(alias = "conditionId")]
-    condition_id: Option<String>,
-    clobTokenIds: Option<serde_json::Value>,
+    #[serde(rename = "clobTokenIds")]
+    clob_token_ids: Option<serde_json::Value>,
     outcomes: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct GammaEvent {
-    title: Option<String>,
-    slug: Option<String>,
     markets: Option<Vec<GammaMarket>>,
 }
 
@@ -114,7 +105,7 @@ pub async fn resolve_btc5m_market(start_ts: i64) -> Result<MarketInfo> {
 
     let token_ids = parse_json_array(
         market
-            .clobTokenIds
+            .clob_token_ids
             .as_ref()
             .unwrap_or(&serde_json::Value::Null),
     );
@@ -125,12 +116,10 @@ pub async fn resolve_btc5m_market(start_ts: i64) -> Result<MarketInfo> {
             .unwrap_or(&serde_json::Value::Null),
     );
     let (up_token_id, down_token_id) = pick_up_down(&outcomes, &token_ids)?;
-    let condition_id = market.condition_id.unwrap_or_default();
 
     Ok(MarketInfo {
         slug: slug.clone(),
         title: market.question.unwrap_or(slug),
-        condition_id,
         start_ts,
         end_ts: start_ts + WINDOW_SEC,
         up_token_id,

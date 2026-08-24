@@ -38,7 +38,6 @@ struct LiveSession {
 
 pub struct OrderClient {
     live: bool,
-    max_order_usd: f64,
     shares: f64,
     max_limit: f64,
     session: Option<LiveSession>,
@@ -49,7 +48,6 @@ impl OrderClient {
         cfg.validate_for_live()?;
         Ok(Self {
             live: cfg.live_trading,
-            max_order_usd: cfg.max_order_usd,
             shares: cfg.order_shares,
             max_limit: default_max_limit(),
             session: None,
@@ -129,13 +127,6 @@ impl OrderClient {
     ) -> Result<()> {
         let limit_px = clamp_price(worst_ask);
         let amount_usd = self.shares * limit_px;
-        if amount_usd > self.max_order_usd {
-            return Err(anyhow!(
-                "order ${:.2} exceeds MAX_ORDER_USD {:.2}",
-                amount_usd,
-                self.max_order_usd
-            ));
-        }
         if amount_usd < 1.0 {
             return Err(anyhow!("minimum order is $1"));
         }

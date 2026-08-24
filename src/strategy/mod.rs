@@ -1,7 +1,6 @@
 //! Pairing strategy constants — mirrors poly-prices `captureSim.rs` defaults.
-//! `TAKER_DELAY_MS` is CLOB-side only (fill ~250ms after submit); live bot sends immediately.
+//! Dry-run taker delay lives in `poly_book::TAKER_DELAY_MS`; live posts immediately.
 
-pub const TAKER_DELAY_MS: i64 = 250;
 pub const PULLBACK: f64 = 0.04;
 pub const PULL_WAIT_MS: i64 = 4_000;
 pub const COOLDOWN_AFTER_EXIT_MS: i64 = 1_500;

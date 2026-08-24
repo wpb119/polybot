@@ -9,7 +9,6 @@ pub struct Config {
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
     pub api_passphrase: Option<String>,
-    pub max_order_usd: f64,
     pub order_shares: f64,
 }
 
@@ -24,7 +23,6 @@ impl Config {
             api_key: env_opt("POLYMARKET_API_KEY"),
             api_secret: env_opt("POLYMARKET_API_SECRET"),
             api_passphrase: env_opt("POLYMARKET_API_PASSPHRASE"),
-            max_order_usd: env_f64("MAX_ORDER_USD", 50.0),
             order_shares: env_f64("ORDER_SHARES", 10.0),
         })
     }
