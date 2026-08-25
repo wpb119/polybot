@@ -1,12 +1,3 @@
-mod bot;
-mod clob;
-mod config;
-mod feeds;
-mod gamma;
-mod pnl;
-mod poly_book;
-mod strategy;
-
 use anyhow::Result;
 use tracing::info;
 
@@ -24,15 +15,24 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let cfg = config::Config::from_env()?;
+    let cfg = polybot::config::Config::from_env()?;
     info!(
-        "polybot — Pairing strategy (BTC BN+CB impulse, pair exit)"
+        "polybot — strategy={} ({})",
+        cfg.strategy.label(),
+        match cfg.strategy {
+            polybot::config::StrategyKind::Pairing => {
+                "BTC BN+CB impulse, pullback entry, pair exit"
+            }
+            polybot::config::StrategyKind::GapSwing => {
+                "major-swing gap capture peak→DOWN / trough→UP + early opposite"
+            }
+        }
     );
     if !cfg.live_trading {
         info!("DRY RUN: set LIVE_TRADING=true and wallet env vars to post orders");
     }
 
-    let mut bot = bot::Bot::new(cfg)?;
+    let mut bot = polybot::bot::Bot::new(cfg)?;
     bot.run().await?;
     Ok(())
 }

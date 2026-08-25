@@ -5,7 +5,7 @@ use anyhow::Result;
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, StrategyKind};
 use crate::clob::OrderClient;
 use crate::feeds::{spawn_binance, spawn_coinbase, spawn_polymarket, BtcQuote, PolyQuote};
 use crate::gamma::{resolve_btc5m_market, MarketInfo};
@@ -14,12 +14,15 @@ use crate::poly_book::{
     PolyBook, subscribe_window_starts, trading_window_start, window_end_ms, window_open_ms,
     TAKER_DELAY_MS,
 };
-use crate::strategy::{BotAction, CaptureSignal, PairingEngine, PositionSide, TrendDetector};
+use crate::strategy::{
+    BotAction, CaptureSignal, GapSwingEngine, PairingEngine, PositionSide, TrendDetector,
+};
 
 #[derive(Clone, Copy, Debug)]
 enum FillKind {
     Entry,
     Pair,
+    Flatten,
 }
 
 struct PendingDryFill {
@@ -29,6 +32,16 @@ struct PendingDryFill {
     kind: FillKind,
     worst_ask: f64,
     reason: String,
+}
+
+enum ActiveEngine {
+    Pairing {
+        detector: TrendDetector,
+        engine: PairingEngine,
+    },
+    GapSwing {
+        engine: GapSwingEngine,
+    },
 }
 
 pub struct Bot {
@@ -42,8 +55,7 @@ pub struct Bot {
     subscribed_starts: Vec<i64>,
     trading_start_ts: Option<i64>,
     trading_market: Option<MarketInfo>,
-    detector: TrendDetector,
-    engine: PairingEngine,
+    active: ActiveEngine,
     poly_book: PolyBook,
     pnl: PnlTracker,
     pending_dry: Vec<PendingDryFill>,
@@ -62,6 +74,20 @@ impl Bot {
         let open_ms = window_open_ms(trade_start);
         let end_ms = window_end_ms(trade_start);
 
+        let active = match cfg.strategy {
+            StrategyKind::Pairing => ActiveEngine::Pairing {
+                detector: TrendDetector::new(open_ms, end_ms, None),
+                engine: PairingEngine::new(),
+            },
+            StrategyKind::GapSwing => {
+                let mut engine = GapSwingEngine::new(open_ms, end_ms, None);
+                // Live: post immediately (delay 0). Dry: model 250ms taker lag.
+                engine.set_taker_delay_ms(if cfg.live_trading { 0 } else { TAKER_DELAY_MS });
+                engine.set_shares(cfg.order_shares);
+                ActiveEngine::GapSwing { engine }
+            }
+        };
+
         Ok(Self {
             cfg,
             orders,
@@ -73,8 +99,7 @@ impl Bot {
             subscribed_starts: vec![],
             trading_start_ts: None,
             trading_market: None,
-            detector: TrendDetector::new(open_ms, end_ms, None),
-            engine: PairingEngine::new(),
+            active,
             poly_book: PolyBook::new(),
             pnl: PnlTracker::new(),
             pending_dry: vec![],
@@ -83,10 +108,15 @@ impl Bot {
 
     pub async fn run(&mut self) -> Result<()> {
         info!(
-            "polybot starting live_trading={} shares={} pre_subscribe=5s taker_delay_dry={}ms",
+            "polybot starting strategy={} live_trading={} shares={} pre_subscribe=5s taker_delay={}ms",
+            self.cfg.strategy.label(),
             self.cfg.live_trading,
             self.cfg.order_shares,
-            TAKER_DELAY_MS
+            if self.cfg.live_trading {
+                0
+            } else {
+                TAKER_DELAY_MS
+            }
         );
         if let Err(e) = self.orders.init_live(&self.cfg).await {
             error!("CLOB init: {:#}", e);
@@ -124,33 +154,101 @@ impl Bot {
             self.process_pending_dry(now);
 
             if self.can_trade(now) {
-                if let Some(m) = self.trading_market.clone() {
-                    if let Some(quotes) = self.poly_book.latest(m.start_ts) {
-                        self.detector.push_poly(quotes.t, quotes.up_ask, quotes.down_ask);
-                    }
-                }
+                self.drive_strategy(now).await;
+            }
+        }
+    }
 
-                let bn_q = self.bn_rx.borrow().clone();
-                if let Some(q) = bn_q {
-                    if let Some(sig) = self.detector.on_bn(q.t, q.price) {
-                        self.handle_signal(&sig, now).await;
-                    }
-                }
-                let cb_q = self.cb_rx.borrow().clone();
-                if let Some(q) = cb_q {
-                    if let Some(sig) = self.detector.on_cb(q.t, q.price) {
-                        self.handle_signal(&sig, now).await;
-                    }
-                }
+    async fn drive_strategy(&mut self, now: i64) {
+        match self.cfg.strategy {
+            StrategyKind::Pairing => self.drive_pairing(now).await,
+            StrategyKind::GapSwing => self.drive_gap_swing(now).await,
+        }
+    }
 
-                if let Some(m) = self.trading_market.clone() {
-                    if let Some(quotes) = self.poly_book.latest(m.start_ts) {
-                        if let Some(action) =
-                            self.engine.tick(now, quotes.up_ask, quotes.down_ask, m.end_ts * 1000)
-                        {
-                            self.execute_action(&action, &m, now).await;
-                        }
+    async fn drive_pairing(&mut self, now: i64) {
+        if let Some(m) = self.trading_market.clone() {
+            if let Some(quotes) = self.poly_book.latest(m.start_ts) {
+                if let ActiveEngine::Pairing { detector, .. } = &mut self.active {
+                    detector.push_poly(quotes.t, quotes.up_ask, quotes.down_ask);
+                }
+            }
+        }
+
+        let bn_q = self.bn_rx.borrow().clone();
+        if let Some(q) = bn_q {
+            let sig = match &mut self.active {
+                ActiveEngine::Pairing { detector, .. } => detector.on_bn(q.t, q.price),
+                _ => None,
+            };
+            if let Some(sig) = sig {
+                self.handle_pairing_signal(&sig, now).await;
+            }
+        }
+        let cb_q = self.cb_rx.borrow().clone();
+        if let Some(q) = cb_q {
+            let sig = match &mut self.active {
+                ActiveEngine::Pairing { detector, .. } => detector.on_cb(q.t, q.price),
+                _ => None,
+            };
+            if let Some(sig) = sig {
+                self.handle_pairing_signal(&sig, now).await;
+            }
+        }
+
+        if let Some(m) = self.trading_market.clone() {
+            if let Some(quotes) = self.poly_book.latest(m.start_ts) {
+                let action = match &mut self.active {
+                    ActiveEngine::Pairing { engine, .. } => {
+                        engine.tick(now, quotes.up_ask, quotes.down_ask, m.end_ts * 1000)
                     }
+                    _ => None,
+                };
+                if let Some(action) = action {
+                    self.execute_action(&action, &m, now).await;
+                }
+            }
+        }
+    }
+
+    async fn drive_gap_swing(&mut self, now: i64) {
+        if let Some(m) = self.trading_market.clone() {
+            if let Some(quotes) = self.poly_book.latest(m.start_ts) {
+                if let ActiveEngine::GapSwing { engine } = &mut self.active {
+                    engine.on_asks(quotes.t, quotes.up_ask, quotes.down_ask);
+                }
+            }
+        }
+
+        let bn_q = self.bn_rx.borrow().clone();
+        if let Some(q) = bn_q {
+            let actions = match &mut self.active {
+                ActiveEngine::GapSwing { engine } => engine.on_binance(q.t, q.price),
+                _ => vec![],
+            };
+            if let Some(m) = self.trading_market.clone() {
+                for action in actions {
+                    self.execute_action(&action, &m, now).await;
+                }
+            }
+        }
+        let cb_q = self.cb_rx.borrow().clone();
+        if let Some(q) = cb_q {
+            if let ActiveEngine::GapSwing { engine } = &mut self.active {
+                let _ = engine.on_coinbase(q.t, q.price);
+            }
+        }
+
+        if let Some(m) = self.trading_market.clone() {
+            if let Some(quotes) = self.poly_book.latest(m.start_ts) {
+                let actions = match &mut self.active {
+                    ActiveEngine::GapSwing { engine } => {
+                        engine.tick(now, quotes.up_ask, quotes.down_ask)
+                    }
+                    _ => vec![],
+                };
+                for action in actions {
+                    self.execute_action(&action, &m, now).await;
                 }
             }
         }
@@ -232,7 +330,12 @@ impl Bot {
             self.market_cache.insert(start_ts, market);
         }
         let market = self.market_cache[&start_ts].clone();
-        info!("trading window {} ({})", market.slug, market.title);
+        info!(
+            "trading window {} ({}) strategy={}",
+            market.slug,
+            market.title,
+            self.cfg.strategy.label()
+        );
 
         let open_ms = window_open_ms(market.start_ts);
         let end_ms = window_end_ms(market.start_ts);
@@ -240,8 +343,21 @@ impl Bot {
         let bn = self.bn_rx.borrow().clone().map(|q| q.price);
         let ptb = cb.or(bn);
 
-        self.detector.reset_window(open_ms, end_ms, ptb);
-        self.engine.reset_window();
+        match &mut self.active {
+            ActiveEngine::Pairing { detector, engine } => {
+                detector.reset_window(open_ms, end_ms, ptb);
+                engine.reset_window();
+            }
+            ActiveEngine::GapSwing { engine } => {
+                engine.reset_window(open_ms, end_ms, ptb);
+                engine.set_shares(self.cfg.order_shares);
+                engine.set_taker_delay_ms(if self.cfg.live_trading {
+                    0
+                } else {
+                    TAKER_DELAY_MS
+                });
+            }
+        }
         self.pnl.open_window(market.slug.clone(), self.cfg.order_shares);
         self.trading_market = Some(market.clone());
         self.trading_start_ts = Some(start_ts);
@@ -257,13 +373,21 @@ impl Bot {
         let end_ms = window_end_ms(start_ts);
         if let Some(m) = self.trading_market.clone() {
             if let Some(quotes) = self.poly_book.latest(start_ts) {
-                if let Some(action) =
-                    self.engine.tick(now, quotes.up_ask, quotes.down_ask, end_ms)
-                {
-                    self.execute_action(&action, &m, now).await;
-                }
-                if let Some(action) = self.engine.try_last_tick_flatten(end_ms) {
-                    self.execute_action(&action, &m, now).await;
+                match &mut self.active {
+                    ActiveEngine::Pairing { engine, .. } => {
+                        let action = engine
+                            .tick(now, quotes.up_ask, quotes.down_ask, end_ms)
+                            .or_else(|| engine.try_last_tick_flatten(end_ms));
+                        if let Some(action) = action {
+                            self.execute_action(&action, &m, now).await;
+                        }
+                    }
+                    ActiveEngine::GapSwing { engine } => {
+                        let actions = engine.tick(now, quotes.up_ask, quotes.down_ask);
+                        for action in actions {
+                            self.execute_action(&action, &m, now).await;
+                        }
+                    }
                 }
             }
         }
@@ -278,7 +402,10 @@ impl Bot {
         let bn = self.bn_rx.borrow().clone().map(|q| q.price);
         let cb = self.cb_rx.borrow().clone().map(|q| q.price);
         let last_btc = bn.or(cb);
-        let ptb = self.detector.strike();
+        let ptb = match &self.active {
+            ActiveEngine::Pairing { detector, .. } => detector.strike(),
+            ActiveEngine::GapSwing { engine } => engine.strike(),
+        };
 
         let winner = resolve_winner(up_ask, down_ask, last_btc, ptb);
         if let Some(close) = self.pnl.close_window(winner) {
@@ -296,14 +423,22 @@ impl Bot {
         let _ = now;
     }
 
-    async fn handle_signal(&mut self, sig: &CaptureSignal, now: i64) {
+    async fn handle_pairing_signal(&mut self, sig: &CaptureSignal, now: i64) {
         if !self.can_trade(now) {
             return;
         }
-        if !self.engine.is_flat() {
+        let flat = match &self.active {
+            ActiveEngine::Pairing { engine, .. } => engine.is_flat(),
+            _ => false,
+        };
+        if !flat {
             return;
         }
-        if let Some(action) = self.engine.on_signal(sig, now) {
+        let action = match &mut self.active {
+            ActiveEngine::Pairing { engine, .. } => engine.on_signal(sig, now),
+            _ => None,
+        };
+        if let Some(action) = action {
             if let Some(m) = self.trading_market.clone() {
                 self.execute_action(&action, &m, now).await;
             }
@@ -318,40 +453,94 @@ impl Bot {
         match action {
             BotAction::BuyEntry {
                 side,
+                signal_t,
                 worst_ask,
                 reason,
             } => {
                 if self.cfg.live_trading {
-                    if let Err(e) = self
+                    match self
                         .orders
                         .buy_side(market, *side, *worst_ask, reason)
                         .await
                     {
-                        error!("entry order failed: {:#}", e);
-                    } else {
-                        self.pnl.record_buy(*side, *worst_ask, self.cfg.order_shares, false);
+                        Err(e) => error!("entry order failed: {:#}", e),
+                        Ok(fill_px) => {
+                            self.pnl.record_buy(
+                                *side,
+                                fill_px,
+                                self.cfg.order_shares,
+                                false,
+                            );
+                            info!("PnL booked {:?} @ actual fill {:.3}", side, fill_px);
+                        }
                     }
                 } else {
-                    self.queue_dry_fill(now, market.start_ts, *side, FillKind::Entry, *worst_ask, reason);
+                    self.queue_dry_fill(
+                        *signal_t,
+                        market.start_ts,
+                        *side,
+                        FillKind::Entry,
+                        *worst_ask,
+                        reason,
+                    );
                 }
             }
             BotAction::BuyPair {
                 side,
+                signal_t,
                 worst_ask,
                 reason,
             } => {
                 if self.cfg.live_trading {
-                    if let Err(e) = self
+                    match self
                         .orders
                         .buy_side(market, *side, *worst_ask, reason)
                         .await
                     {
-                        error!("pair order failed: {:#}", e);
-                    } else {
-                        self.pnl.record_buy(*side, *worst_ask, self.cfg.order_shares, true);
+                        Err(e) => error!("pair order failed: {:#}", e),
+                        Ok(fill_px) => {
+                            self.pnl.record_buy(
+                                *side,
+                                fill_px,
+                                self.cfg.order_shares,
+                                true,
+                            );
+                            info!("PnL booked {:?} @ actual fill {:.3}", side, fill_px);
+                        }
                     }
                 } else {
-                    self.queue_dry_fill(now, market.start_ts, *side, FillKind::Pair, *worst_ask, reason);
+                    self.queue_dry_fill(
+                        *signal_t,
+                        market.start_ts,
+                        *side,
+                        FillKind::Pair,
+                        *worst_ask,
+                        reason,
+                    );
+                }
+            }
+            BotAction::SellFlatten {
+                side,
+                signal_t,
+                worst_ask,
+                reason,
+            } => {
+                // Dry-run: mark sell at ask−1¢ after delay.
+                // Live: no sell API yet — hold unpaired to settlement (log once per intent).
+                if self.cfg.live_trading {
+                    warn!(
+                        "[LIVE] flatten {:?} @~{:.3} reason={} (sell not posted — hold to settle)",
+                        side, worst_ask, reason
+                    );
+                } else {
+                    self.queue_dry_fill(
+                        *signal_t,
+                        market.start_ts,
+                        *side,
+                        FillKind::Flatten,
+                        (*worst_ask - 0.01).max(0.01),
+                        reason,
+                    );
                 }
             }
         }
@@ -423,15 +612,21 @@ impl Bot {
 
     fn apply_dry_fill(&mut self, fill: &PendingDryFill, force: bool) {
         let fill_t = fill.send_t + TAKER_DELAY_MS;
-        let fill_px = self
-            .poly_book
-            .ask_before(fill.start_ts, fill_t, fill.side)
-            .unwrap_or(fill.worst_ask);
+        let fill_px = match fill.kind {
+            FillKind::Flatten => fill.worst_ask, // already ask−1¢
+            _ => self
+                .poly_book
+                .ask_before(fill.start_ts, fill_t, fill.side)
+                .unwrap_or(fill.worst_ask),
+        };
 
-        let is_pair = matches!(fill.kind, FillKind::Pair);
-        let label = if is_pair { "PAIR" } else { "ENTRY" };
+        let label = match fill.kind {
+            FillKind::Entry => "ENTRY",
+            FillKind::Pair => "PAIR",
+            FillKind::Flatten => "SELL",
+        };
         warn!(
-            "[DRY] {} {:?} {:.0}sh @ {:.3} (send+{}ms) reason={}",
+            "[DRY] {} {:?} {:.0}sh @ {:.3} (signal+{}ms) reason={}",
             label,
             fill.side,
             self.cfg.order_shares,
@@ -441,7 +636,20 @@ impl Bot {
         );
 
         if force || self.trading_start_ts == Some(fill.start_ts) {
-            self.pnl.record_buy(fill.side, fill_px, self.cfg.order_shares, is_pair);
+            match fill.kind {
+                FillKind::Flatten => {
+                    self.pnl
+                        .record_sell(fill.side, fill_px, self.cfg.order_shares);
+                }
+                FillKind::Entry => {
+                    self.pnl
+                        .record_buy(fill.side, fill_px, self.cfg.order_shares, false);
+                }
+                FillKind::Pair => {
+                    self.pnl
+                        .record_buy(fill.side, fill_px, self.cfg.order_shares, true);
+                }
+            }
         }
     }
 }

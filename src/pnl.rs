@@ -55,6 +55,7 @@ impl PnlTracker {
         });
     }
 
+    /// `fill_px` is the actual CLOB fill (live) or dry-run modeled fill.
     pub fn record_buy(&mut self, side: PositionSide, fill_px: f64, shares: f64, is_pair: bool) {
         let w = self.window.as_mut().expect("window ledger");
         let fee = taker_fee_usdc(shares, fill_px);
@@ -67,6 +68,18 @@ impl PnlTracker {
         } else {
             w.entry_side = Some(side);
         }
+    }
+
+    /// Flatten sell proceeds (gap-swing emergency exit).
+    pub fn record_sell(&mut self, _side: PositionSide, fill_px: f64, shares: f64) {
+        let w = self.window.as_mut().expect("window ledger");
+        let fee = taker_fee_usdc(shares, fill_px);
+        w.fees += fee;
+        // Proceeds reduce net cost; mark as paired so we don't settle the token again.
+        w.cost -= shares * fill_px - fee;
+        w.paired = true;
+        w.legs += 1;
+        w.entry_side = None;
     }
 
     pub fn close_window(&mut self, winner: Option<PositionSide>) -> Option<WindowClose> {

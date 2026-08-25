@@ -1,5 +1,4 @@
-//! Pairing strategy constants — mirrors poly-prices `captureSim.rs` defaults.
-//! Dry-run: fill at send+TAKER_DELAY_MS. Live: post immediately (CLOB taker delay).
+//! Strategy modules — Pairing (default historical) + GapSwing (major-swing gap capture).
 
 pub const TAKER_DELAY_MS: i64 = 250;
 pub const PULLBACK: f64 = 0.04;
@@ -10,7 +9,11 @@ pub const HOLD_MFE: f64 = 0.02;
 pub const MIN_BOOK_LAG: f64 = 0.015;
 pub const MAX_TOKEN_ASK: f64 = 0.75;
 pub const DEAD_ASK: f64 = 0.20;
+pub const DEAD_CRITICAL_ASK: f64 = 0.06;
 pub const DEAD_LEFT_MS: i64 = 90_000;
+pub const CHASE_MAE: f64 = 0.06;
+pub const CHASE_MAE_MS: i64 = 15_000;
+pub const MAX_PAIR_FILL: f64 = 0.92;
 
 pub const GAP_TIME_Z_AT_MIN_SEC: f64 = 0.5;
 pub const GAP_TIME_Z_AT_MAX_SEC: f64 = 2.0;
@@ -29,8 +32,10 @@ pub const COOLDOWN_MS: i64 = 12_000;
 pub const MAX_CAPTURES: u32 = 3;
 
 mod detector;
+mod gap_swing;
 mod gates;
 mod pairing;
 
 pub use detector::{CaptureSignal, TrendDetector};
+pub use gap_swing::{run_window as run_gap_swing_window, GapSwingEngine, WindowResult};
 pub use pairing::{BotAction, PairingEngine, PositionSide};

@@ -6,8 +6,8 @@ use tracing::info;
 use super::detector::CaptureSignal;
 use super::gates::{other_side_ask, should_skip_gap_time, should_skip_token_trend, CaptureGateInput, Side};
 use super::{
-    DEAD_ASK, DEAD_LEFT_MS, HOLD_MFE, MAX_TOKEN_ASK, MIN_BOOK_LAG, PULLBACK, PULL_WAIT_MS,
-    TAKER_DELAY_MS,
+    CHASE_MAE, CHASE_MAE_MS, DEAD_ASK, DEAD_CRITICAL_ASK, DEAD_LEFT_MS, HOLD_MFE, MAX_PAIR_FILL,
+    MAX_TOKEN_ASK, MIN_BOOK_LAG, PULLBACK, PULL_WAIT_MS, TAKER_DELAY_MS,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,11 +29,21 @@ impl From<Side> for PositionSide {
 pub enum BotAction {
     BuyEntry {
         side: PositionSide,
+        /// Intent / signal time (ms). Dry-run fills at signal_t + TAKER_DELAY_MS.
+        signal_t: i64,
         worst_ask: f64,
         reason: String,
     },
     BuyPair {
         side: PositionSide,
+        signal_t: i64,
+        worst_ask: f64,
+        reason: String,
+    },
+    /// Emergency flatten — sell held token (ask − 1¢). Used by gap_swing dry-run/backtest.
+    SellFlatten {
+        side: PositionSide,
+        signal_t: i64,
         worst_ask: f64,
         reason: String,
     },
@@ -186,6 +196,7 @@ impl PairingEngine {
                 };
                 return Some(BotAction::BuyEntry {
                     side,
+                    signal_t: now_ms,
                     worst_ask: clamp_price(ask + 0.02),
                     reason: "pullback fill".into(),
                 });
@@ -202,6 +213,7 @@ impl PairingEngine {
                 };
                 return Some(BotAction::BuyEntry {
                     side,
+                    signal_t: now_ms,
                     worst_ask: clamp_price(ask + 0.02),
                     reason: "chase fill".into(),
                 });
@@ -219,7 +231,7 @@ impl PairingEngine {
                 } => (*side, *entry_t, *peak_ask),
                 _ => unreachable!(),
             };
-            let (side, entry_t, peak_ask) = holding;
+            let (side, entry_t, _peak_ask) = holding;
             if now_ms >= entry_t + 400 {
                 let ask = side_ask(side, up_ask, down_ask);
                 let obs = self.ask_before(now_ms, side).unwrap_or(ask);
@@ -252,12 +264,17 @@ impl PairingEngine {
             }
             let ask = side_ask(*side, up_ask, down_ask);
             let obs = self.ask_before(now_ms, *side).unwrap_or(ask);
-            let peak = if obs > *peak_ask { obs } else { *peak_ask };
-            let locked = peak - *entry_ask >= HOLD_MFE;
+            let locked = *peak_ask - *entry_ask >= HOLD_MFE;
             let mut reason = None;
-            // DEFAULT_SIM: skipDeadFlatten=false, skipCloseFlatten=true, skipTrail/Flip=true
-            if !locked && end_ms - now_ms <= DEAD_LEFT_MS as i64 && obs <= DEAD_ASK {
+            if end_ms - now_ms <= DEAD_LEFT_MS as i64
+                && obs <= DEAD_ASK
+                && (!locked || obs <= DEAD_CRITICAL_ASK)
+            {
                 reason = Some("dead flatten");
+            } else if now_ms - *entry_t <= CHASE_MAE_MS
+                && *entry_ask - obs >= CHASE_MAE
+            {
+                reason = Some("chase mae");
             }
             reason.map(|r| (*side, obs, r))
         } else {
@@ -279,6 +296,7 @@ impl PairingEngine {
             };
             return Some(BotAction::BuyPair {
                 side: pair_side,
+                signal_t: now_ms,
                 worst_ask: clamp_price(pair_ask + 0.02),
                 reason: reason.into(),
             });
@@ -293,9 +311,9 @@ impl PairingEngine {
             side,
             entry_t,
             entry_ask,
-            peak_ask,
             last_obs_t,
             last_obs_ask,
+            ..
         } = &self.state
         else {
             return None;
@@ -304,8 +322,7 @@ impl PairingEngine {
         if *entry_t + 400 > end_ms {
             return None;
         }
-        let locked = *peak_ask - *entry_ask >= HOLD_MFE;
-        if locked || *last_obs_ask > *entry_ask || *last_obs_t >= end_ms {
+        if *last_obs_ask > *entry_ask || *last_obs_t >= end_ms {
             return None;
         }
 
@@ -314,6 +331,9 @@ impl PairingEngine {
             PositionSide::Down => Side::Down,
         };
         let pair_ask = other_side_ask(held_side, *last_obs_ask);
+        if pair_ask > MAX_PAIR_FILL {
+            return None;
+        }
         let pair_side = match *side {
             PositionSide::Up => PositionSide::Down,
             PositionSide::Down => PositionSide::Up,
@@ -325,6 +345,7 @@ impl PairingEngine {
 
         Some(BotAction::BuyPair {
             side: pair_side,
+            signal_t: end_ms,
             worst_ask: clamp_price(pair_ask + 0.02),
             reason: "last tick flatten".into(),
         })
