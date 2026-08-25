@@ -30,6 +30,11 @@ pub fn default_max_limit() -> f64 {
     0.99
 }
 
+/// GTC sell floor. 0.01 crosses the book like a market sell (history models ask−1¢).
+pub fn default_min_sell_limit() -> f64 {
+    0.01
+}
+
 struct PresignedSlot {
     limit_px: f64,
     signed: SignedOrder,
@@ -38,13 +43,15 @@ struct PresignedSlot {
 struct LiveSession {
     client: Client<Authenticated<Normal>>,
     signer: PrivateKeySigner,
-    presigned: HashMap<String, PresignedSlot>,
+    presigned_buys: HashMap<String, PresignedSlot>,
+    presigned_sells: HashMap<String, PresignedSlot>,
 }
 
 pub struct OrderClient {
     live: bool,
     shares: f64,
     max_limit: f64,
+    min_sell: f64,
     session: Option<LiveSession>,
 }
 
@@ -55,6 +62,7 @@ impl OrderClient {
             live: cfg.live_trading,
             shares: cfg.order_shares,
             max_limit: default_max_limit(),
+            min_sell: default_min_sell_limit(),
             session: None,
         })
     }
@@ -101,24 +109,26 @@ impl OrderClient {
         self.session = Some(LiveSession {
             client,
             signer,
-            presigned: HashMap::new(),
+            presigned_buys: HashMap::new(),
+            presigned_sells: HashMap::new(),
         });
         Ok(())
     }
 
-    /// Presign GTC limit buys for both legs (refreshed after each post).
+    /// Presign GTC limit buys (0.99) and sells (0.01) for both legs.
     pub async fn prepare_market(&mut self, market: &MarketInfo) -> Result<()> {
         if !self.live {
             return Ok(());
         }
-        let limit = self.max_limit;
-        self.presign_token(&market.up_token_id, limit).await?;
-        self.presign_token(&market.down_token_id, limit).await?;
+        let buy_px = self.max_limit;
+        let sell_px = self.min_sell;
+        for token in [&market.up_token_id, &market.down_token_id] {
+            self.presign_buy_token(token, buy_px).await?;
+            self.presign_sell_token(token, sell_px).await?;
+        }
         info!(
-            "presigned GTC buys for {} @ limit {:.2} ({:.0} sh each)",
-            market.slug,
-            limit,
-            self.shares
+            "presigned GTC buys@{:.2} + sells@{:.2} for {} ({:.0} sh each)",
+            buy_px, sell_px, market.slug, self.shares
         );
         Ok(())
     }
@@ -155,10 +165,19 @@ impl OrderClient {
         let shares = self.shares;
         let max_limit = self.max_limit;
 
-        let signed = match session.presigned.remove(&token_id) {
+        let signed = match session.presigned_buys.remove(&token_id) {
             Some(slot) if (slot.limit_px - limit_px).abs() < 1e-9 => slot.signed,
-            _ => presign_limit_buy(&session.client, &session.signer, &token_id, shares, limit_px)
-                .await?,
+            _ => {
+                presign_limit_order(
+                    &session.client,
+                    &session.signer,
+                    &token_id,
+                    shares,
+                    limit_px,
+                    SdkSide::Buy,
+                )
+                .await?
+            }
         };
 
         let resp = session.client.post_order(signed).await.context("post order")?;
@@ -184,16 +203,17 @@ impl OrderClient {
             resp.status
         );
 
-        if let Ok(signed) = presign_limit_buy(
+        if let Ok(signed) = presign_limit_order(
             &session.client,
             &session.signer,
             &token_id,
             shares,
             max_limit,
+            SdkSide::Buy,
         )
         .await
         {
-            session.presigned.insert(
+            session.presigned_buys.insert(
                 token_id,
                 PresignedSlot {
                     limit_px: max_limit,
@@ -202,7 +222,7 @@ impl OrderClient {
             );
         } else {
             warn!(
-                "presign replenish {} failed",
+                "presign buy replenish {} failed",
                 token_id.chars().take(12).collect::<String>()
             );
         }
@@ -210,39 +230,150 @@ impl OrderClient {
         Ok(fill_px)
     }
 
-    async fn presign_token(&mut self, token_id: &str, limit_px: f64) -> Result<()> {
+    /// Posts a GTC sell at `min_sell` (0.01, market-like). Returns **actual fill** for PnL.
+    pub async fn sell_side(
+        &mut self,
+        market: &MarketInfo,
+        side: PositionSide,
+        worst_ask: f64,
+        reason: &str,
+        shares: f64,
+    ) -> Result<f64> {
+        let intent_px = clamp_price((worst_ask - 0.01).max(0.01));
+        let limit_px = self.min_sell;
+        let shares = if shares > 0.0 { shares } else { self.shares };
+
+        let token_id = match side {
+            PositionSide::Up => market.up_token_id.clone(),
+            PositionSide::Down => market.down_token_id.clone(),
+        };
+
         if !self.live {
-            return Ok(());
+            return Ok(intent_px);
         }
+
+        let session = self
+            .session
+            .as_mut()
+            .context("live session not initialized — call init_live()")?;
+
+        let min_sell = self.min_sell;
+
+        let signed = match session.presigned_sells.remove(&token_id) {
+            Some(slot) if (slot.limit_px - limit_px).abs() < 1e-9 => slot.signed,
+            _ => {
+                presign_limit_order(
+                    &session.client,
+                    &session.signer,
+                    &token_id,
+                    shares,
+                    limit_px,
+                    SdkSide::Sell,
+                )
+                .await?
+            }
+        };
+
+        let resp = session.client.post_order(signed).await.context("post sell")?;
+        if !resp.success {
+            return Err(anyhow!(
+                "post sell failed: {}",
+                resp.error_msg.unwrap_or_else(|| resp.order_id.clone())
+            ));
+        }
+
+        let fill_px = resolve_actual_fill(&session.client, &resp, &token_id, shares).await?;
+        let _ = session.client.cancel_order(&resp.order_id).await;
+
+        warn!(
+            "[LIVE] GTC SELL {:?} {:.0}sh limit={:.3} fill={:.3} intent={:.3} reason={} order_id={} status={:?}",
+            side,
+            shares,
+            limit_px,
+            fill_px,
+            intent_px,
+            reason,
+            resp.order_id,
+            resp.status
+        );
+
+        if let Ok(signed) = presign_limit_order(
+            &session.client,
+            &session.signer,
+            &token_id,
+            self.shares,
+            min_sell,
+            SdkSide::Sell,
+        )
+        .await
+        {
+            session.presigned_sells.insert(
+                token_id,
+                PresignedSlot {
+                    limit_px: min_sell,
+                    signed,
+                },
+            );
+        } else {
+            warn!(
+                "presign sell replenish {} failed",
+                token_id.chars().take(12).collect::<String>()
+            );
+        }
+
+        Ok(fill_px)
+    }
+
+    async fn presign_buy_token(&mut self, token_id: &str, limit_px: f64) -> Result<()> {
         let session = self
             .session
             .as_mut()
             .context("live session not initialized")?;
-        let signed = presign_limit_buy(
+        let signed = presign_limit_order(
             &session.client,
             &session.signer,
             token_id,
             self.shares,
             limit_px,
+            SdkSide::Buy,
         )
         .await?;
-        session.presigned.insert(
+        session.presigned_buys.insert(
             token_id.to_string(),
-            PresignedSlot {
-                limit_px,
-                signed,
-            },
+            PresignedSlot { limit_px, signed },
+        );
+        Ok(())
+    }
+
+    async fn presign_sell_token(&mut self, token_id: &str, limit_px: f64) -> Result<()> {
+        let session = self
+            .session
+            .as_mut()
+            .context("live session not initialized")?;
+        let signed = presign_limit_order(
+            &session.client,
+            &session.signer,
+            token_id,
+            self.shares,
+            limit_px,
+            SdkSide::Sell,
+        )
+        .await?;
+        session.presigned_sells.insert(
+            token_id.to_string(),
+            PresignedSlot { limit_px, signed },
         );
         Ok(())
     }
 }
 
-async fn presign_limit_buy(
+async fn presign_limit_order(
     client: &Client<Authenticated<Normal>>,
     signer: &PrivateKeySigner,
     token_id: &str,
     shares: f64,
     limit_px: f64,
+    side: SdkSide,
 ) -> Result<SignedOrder> {
     let tid = token_id.parse().context("token id parse")?;
     let price = Decimal::from_str(&format!("{:.2}", limit_px)).context("price parse")?;
@@ -253,7 +384,7 @@ async fn presign_limit_buy(
         .token_id(tid)
         .price(price)
         .size(size)
-        .side(SdkSide::Buy)
+        .side(side)
         .order_type(OrderType::GTC)
         .build()
         .await

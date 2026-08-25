@@ -126,3 +126,63 @@ pub async fn resolve_btc5m_market(start_ts: i64) -> Result<MarketInfo> {
         down_token_id,
     })
 }
+
+/// Polymarket event-page Price to Beat = Chainlink 60s TWAP open (`crypto-price`).
+pub async fn fetch_official_ptb(start_ts: i64) -> Result<Option<f64>> {
+    let client = reqwest::Client::new();
+    let start = chrono_iso(start_ts);
+    let end = chrono_iso(start_ts + WINDOW_SEC);
+    let res = client
+        .get("https://polymarket.com/api/crypto/crypto-price")
+        .query(&[
+            ("symbol", "BTC"),
+            ("eventStartTime", start.as_str()),
+            ("variant", "fiveminute"),
+            ("endDate", end.as_str()),
+            ("twapEnabled", "true"),
+            ("twapLookbackSeconds", "60"),
+        ])
+        .header("user-agent", "Mozilla/5.0 (compatible; polybot/0.1)")
+        .header("accept", "application/json")
+        .header("referer", "https://polymarket.com/")
+        .send()
+        .await
+        .context("crypto-price fetch")?;
+    if !res.status().is_success() {
+        return Ok(None);
+    }
+    let body: serde_json::Value = res.json().await.context("crypto-price json")?;
+    let px = body
+        .get("openPrice")
+        .and_then(|v| v.as_f64().or_else(|| v.as_str().and_then(|s| s.parse().ok())));
+    Ok(px.filter(|p| *p > 0.0))
+}
+
+fn chrono_iso(ts: i64) -> String {
+    use std::time::{Duration, UNIX_EPOCH};
+    let secs = (UNIX_EPOCH + Duration::from_secs(ts as u64))
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let days = (secs / 86400) as i64;
+    let rem = secs % 86400;
+    let hour = rem / 3600;
+    let min = (rem % 3600) / 60;
+    let sec = rem % 60;
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+fn civil_from_days(z: i64) -> (i32, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m, d)
+}

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
@@ -24,10 +24,11 @@ struct TokenMeta {
     is_up: bool,
 }
 
+/// Unbounded ask stream — bot must drain every update (watch-latest drops fill-time asks).
 pub fn spawn_polymarket(
     markets_rx: watch::Receiver<Vec<MarketInfo>>,
-) -> watch::Receiver<Option<PolyQuote>> {
-    let (tx, rx) = watch::channel(None);
+) -> mpsc::UnboundedReceiver<PolyQuote> {
+    let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut backoff = Duration::from_secs(1);
         loop {
@@ -47,7 +48,7 @@ pub fn spawn_polymarket(
 }
 
 async fn run_session(
-    tx: &watch::Sender<Option<PolyQuote>>,
+    tx: &mpsc::UnboundedSender<PolyQuote>,
     markets: &[MarketInfo],
     markets_rx: &watch::Receiver<Vec<MarketInfo>>,
 ) -> Result<()> {
@@ -107,14 +108,20 @@ async fn run_session(
         }
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(text) {
             apply_msg(&v, &token_map, &mut books);
+            let t = now_ms();
             for (start_ts, state) in &books {
                 if let (Some(u), Some(d)) = (state.up_ask, state.down_ask) {
-                    tx.send_replace(Some(PolyQuote {
-                        t: now_ms(),
-                        start_ts: *start_ts,
-                        up_ask: u,
-                        down_ask: d,
-                    }));
+                    if tx
+                        .send(PolyQuote {
+                            t,
+                            start_ts: *start_ts,
+                            up_ask: u,
+                            down_ask: d,
+                        })
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
                 }
             }
         }

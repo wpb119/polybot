@@ -1,7 +1,6 @@
-//! Gap-swing engine — port of poly-history `new_strategy/strategy-gap-swing.js` (raw mode).
-//! Batch `run_window` matches the major-swing gap-capture economics. Live/dry engine
-//! re-runs that simulator on the buffered window. Unpaired near expiry: buy opposite
-//! (`EMERGENCY_OPP`) instead of selling.
+//! Gap-swing engine — port of poly-history raw gapCapture.
+//! Dry/backtest: t+250ms fill model (same as poly-history).
+//! Live: taker_delay=0 — fire and post as soon as the swing/pair signal is captured.
 
 use std::collections::HashSet;
 
@@ -32,6 +31,7 @@ pub const DELAY_BUFFER_PER_LEG: f64 = 0.005;
 pub const MIN_RAW_PAIR_NET: f64 = 0.0;
 pub const EMERGENCY_LEFT_MS: i64 = 25_000;
 pub const FEE_RATE: f64 = 0.07;
+pub const SELL_HAIRCUT: f64 = 0.01;
 pub const SHARES: f64 = 10.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +78,21 @@ struct Lot {
     anchor_d: f64,
 }
 
+/// Live fills already posted — seeded into re-sims so zigzag trough/peak
+/// replacement cannot emit a second same-side first-leg (poly-history raw
+/// runs once on a full tape; live re-runs every tick).
+#[derive(Clone, Debug)]
+pub struct CommittedLot {
+    pub side: PositionSide,
+    pub shares: f64,
+    pub fill: f64,
+    pub fill_t: i64,
+    pub paired: f64,
+    pub anchor_d: f64,
+    /// true = trough→UP first leg; false = peak→DOWN first leg.
+    pub from_trough: bool,
+}
+
 /// Exact batch sim matching `strategy-gap-swing.js` runWindow (mode=raw).
 ///
 /// `end_ms` is the sim horizon (live may truncate to now). Pass `market_end_ms`
@@ -97,6 +112,32 @@ pub fn run_window(
     market_end_ms: Option<i64>,
     taker_delay_ms: i64,
 ) -> WindowResult {
+    run_window_with_commits(
+        open_ms,
+        end_ms,
+        ptb,
+        btc,
+        asks,
+        winner,
+        shares,
+        market_end_ms,
+        taker_delay_ms,
+        &[],
+    )
+}
+
+pub fn run_window_with_commits(
+    open_ms: i64,
+    end_ms: i64,
+    ptb: Option<f64>,
+    btc: &[(i64, f64)],
+    asks: &[(i64, f64, f64)],
+    winner: Option<PositionSide>,
+    shares: f64,
+    market_end_ms: Option<i64>,
+    taker_delay_ms: i64,
+    commits: &[CommittedLot],
+) -> WindowResult {
     let mut out = WindowResult::default();
     let Some(ptb) = ptb else {
         return out;
@@ -106,13 +147,64 @@ pub fn run_window(
     }
 
     let market_end = market_end_ms.unwrap_or(end_ms);
-    let swings = detect_major_swings(btc, asks, open_ms, end_ms, ptb);
+    let swings = detect_major_swings(btc, asks, open_ms, end_ms, market_end, ptb);
     let last_ask = asks.last().copied();
-    let mut lots: Vec<Lot> = Vec::new();
+    let mut lots: Vec<Lot> = commits
+        .iter()
+        .map(|c| Lot {
+            side: c.side,
+            shares: c.shares,
+            fill: c.fill,
+            fee: taker_fee_usdc(c.shares, c.fill),
+            paired: c.paired,
+            ext_kind: if c.from_trough {
+                ExtKind::Trough
+            } else {
+                ExtKind::Peak
+            },
+            anchor_d: c.anchor_d,
+        })
+        .collect();
     let mut pairs_done: u32 = 0;
+    // Count completed pairs already in commits (each pair removes 2×shares unpaired).
+    {
+        let up_p: f64 = commits
+            .iter()
+            .filter(|c| c.side == PositionSide::Up)
+            .map(|c| c.paired)
+            .sum();
+        let dn_p: f64 = commits
+            .iter()
+            .filter(|c| c.side == PositionSide::Down)
+            .map(|c| c.paired)
+            .sum();
+        if shares > 0.0 {
+            pairs_done = (up_p.min(dn_p) / shares).floor() as u32;
+        }
+    }
     let mut missed: u32 = 0;
-    let mut next_trade_t = open_ms;
-    let mut anchor: Option<(i64, f64, PositionSide, ExtKind)> = None;
+    let mut next_trade_t = commits
+        .iter()
+        .map(|c| c.fill_t)
+        .max()
+        .map(|t| t + 400)
+        .unwrap_or(open_ms);
+    let mut anchor: Option<(i64, f64, PositionSide, ExtKind)> = commits
+        .iter()
+        .rev()
+        .find(|c| c.shares - c.paired > 1e-12)
+        .map(|c| {
+            (
+                c.fill_t,
+                c.anchor_d,
+                c.side,
+                if c.from_trough {
+                    ExtKind::Trough
+                } else {
+                    ExtKind::Peak
+                },
+            )
+        });
 
     let unpaired_lots = |lots: &Vec<Lot>, side: PositionSide| -> Vec<usize> {
         lots.iter()
@@ -157,7 +249,11 @@ pub fn run_window(
 
     let try_fill = |asks: &[(i64, f64, f64)], t: i64, side: PositionSide| -> Option<(i64, f64)> {
         let fill_t = t + taker_delay_ms;
-        // Use real market end — truncated live horizon would block every near-now fill.
+        // Live truncated horizon: never "fill" in the future with a present ask
+        // (that desyncs fire points from the history viewer).
+        if fill_t > end_ms {
+            return None;
+        }
         if fill_t >= market_end - 600 {
             return None;
         }
@@ -236,10 +332,7 @@ pub fn run_window(
         let Some(ask) = ask_at(asks, t, side) else {
             return false;
         };
-        let force = tag.starts_with("EMERGENCY");
-        let max_ask = if force {
-            0.95
-        } else if tag.starts_with("EARLY_") {
+        let max_ask = if tag.starts_with("EARLY_") {
             MAX_EARLY_OPP_ASK
         } else {
             MAX_SECOND_ASK
@@ -247,14 +340,14 @@ pub fn run_window(
         if ask < MIN_ASK || ask > max_ask {
             return false;
         }
-        if !force && !net_gap_ok(first_fill, ask) {
+        if !net_gap_ok(first_fill, ask) {
             return false;
         }
         let Some((fill_t, fill)) = try_fill(asks, t, side) else {
             *missed += 1;
             return false;
         };
-        if !force && !net_gap_ok(first_fill, fill) {
+        if !net_gap_ok(first_fill, fill) {
             *missed += 1;
             return false;
         }
@@ -273,7 +366,10 @@ pub fn run_window(
     }
     let mut events: Vec<Ev> = swings.into_iter().map(Ev::Swing).collect();
     let mut t = open_ms + 1000;
-    while t < end_ms - MIN_LEFT_MS {
+    // minLeft is vs real window close — never vs truncated live `end_ms` (that delayed
+    // ticks/swings by 10s and desynced pairing vs the history chart).
+    let tick_until = end_ms.min(market_end - MIN_LEFT_MS);
+    while t < tick_until {
         if let Some(px) = px_at(btc, t) {
             events.push(Ev::Tick {
                 t,
@@ -349,7 +445,13 @@ pub fn run_window(
                         sw.t,
                         sw.side,
                         sw.kind,
-                        &format!("SWING_{:?}_2", sw.kind),
+                        &format!(
+                            "SWING_{}_2",
+                            match sw.kind {
+                                ExtKind::Peak => "PEAK",
+                                ExtKind::Trough => "TROUGH",
+                            }
+                        ),
                     );
                     continue;
                 }
@@ -397,7 +499,13 @@ pub fn run_window(
                     fill,
                     sw.kind,
                     false,
-                    &format!("SWING_{:?}", sw.kind),
+                    &format!(
+                        "SWING_{}",
+                        match sw.kind {
+                            ExtKind::Peak => "PEAK",
+                            ExtKind::Trough => "TROUGH",
+                        }
+                    ),
                     sw.d,
                 );
             }
@@ -405,35 +513,41 @@ pub fn run_window(
     }
 
     let last_t = market_end - EMERGENCY_LEFT_MS;
-    // Last 25s: if still unpaired, buy opposite (force pair) instead of selling.
+    // Original gapCapture: flatten unpaired near expiry (ask−1¢). Not an extra opposite buy.
     if unpaired_shares(&lots) > 0.0 && last_t > open_ms && end_ms >= last_t {
-        if !unpaired_lots(&lots, PositionSide::Up).is_empty() {
-            try_second_leg(
-                &mut lots,
-                &mut out.trades,
-                &mut pairs_done,
-                &mut next_trade_t,
-                &mut anchor,
-                &mut missed,
-                last_t,
-                PositionSide::Down,
-                ExtKind::Peak,
-                "EMERGENCY_OPP",
-            );
-        }
-        if !unpaired_lots(&lots, PositionSide::Down).is_empty() {
-            try_second_leg(
-                &mut lots,
-                &mut out.trades,
-                &mut pairs_done,
-                &mut next_trade_t,
-                &mut anchor,
-                &mut missed,
-                last_t,
-                PositionSide::Up,
-                ExtKind::Trough,
-                "EMERGENCY_OPP",
-            );
+        let fill_t = last_t + taker_delay_ms;
+        if fill_t < market_end - 400 {
+            for side in [PositionSide::Up, PositionSide::Down] {
+                let idxs = unpaired_lots(&lots, side);
+                if idxs.is_empty() {
+                    continue;
+                }
+                let Some(ask) = ask_at(asks, fill_t, side) else {
+                    continue;
+                };
+                if ask <= 0.0 {
+                    continue;
+                }
+                let px = (ask - SELL_HAIRCUT).max(0.01);
+                for i in idxs {
+                    let q = lots[i].shares - lots[i].paired;
+                    if q <= 0.0 {
+                        continue;
+                    }
+                    let fee_s = taker_fee_usdc(q, px);
+                    let fee_buy = (lots[i].fee * q) / lots[i].shares;
+                    lots[i].paired = lots[i].shares;
+                    out.trades.push(SimTrade {
+                        kind: "SELL",
+                        side,
+                        t: fill_t,
+                        fill: px,
+                        shares: q,
+                        reason: "flatten".into(),
+                        net: q * px - (q * lots[i].fill + fee_buy) - fee_s,
+                    });
+                }
+            }
         }
     }
 
@@ -486,6 +600,7 @@ fn detect_major_swings(
     asks: &[(i64, f64, f64)],
     open_ms: i64,
     end_ms: i64,
+    market_end: i64,
     ptb: f64,
 ) -> Vec<Swing> {
     let mut grid = Vec::new();
@@ -607,7 +722,7 @@ fn detect_major_swings(
         if ask < MIN_ASK {
             continue;
         }
-        if end_ms - e.0 < MIN_LEFT_MS {
+        if market_end - e.0 < MIN_LEFT_MS {
             continue;
         }
         let last = out.last();
@@ -699,6 +814,8 @@ pub struct GapSwingEngine {
     asks: Vec<(i64, f64, f64)>,
     emitted: HashSet<String>,
     pending: Vec<BotAction>,
+    /// Fills already posted live (or applied dry) — seed re-sims.
+    commits: Vec<CommittedLot>,
     shares: f64,
     /// 250 dry/backtest; **0** live (post immediately at signal).
     taker_delay_ms: i64,
@@ -716,6 +833,7 @@ impl GapSwingEngine {
             asks: vec![],
             emitted: HashSet::new(),
             pending: vec![],
+            commits: vec![],
             shares: SHARES,
             taker_delay_ms: TAKER_DELAY_MS,
             last_pnl: 0.0,
@@ -726,9 +844,23 @@ impl GapSwingEngine {
     pub fn reset_window(&mut self, open_ms: i64, end_ms: i64, ptb: Option<f64>) {
         let shares = self.shares;
         let delay = self.taker_delay_ms;
+        let btc: Vec<_> = self
+            .btc
+            .iter()
+            .copied()
+            .filter(|(t, _)| *t >= open_ms - 60_000 && *t < end_ms)
+            .collect();
+        let asks: Vec<_> = self
+            .asks
+            .iter()
+            .copied()
+            .filter(|(t, _, _)| *t >= open_ms - 60_000 && *t < end_ms)
+            .collect();
         *self = Self::new(open_ms, end_ms, ptb);
         self.shares = shares;
         self.taker_delay_ms = delay;
+        self.btc = btc;
+        self.asks = asks;
     }
 
     pub fn set_shares(&mut self, shares: f64) {
@@ -738,6 +870,12 @@ impl GapSwingEngine {
     /// Live trading: 0 (immediate). Dry/backtest: 250.
     pub fn set_taker_delay_ms(&mut self, delay_ms: i64) {
         self.taker_delay_ms = delay_ms.max(0);
+    }
+
+    pub fn set_strike(&mut self, ptb: f64) {
+        if ptb > 0.0 {
+            self.ptb = Some(ptb);
+        }
     }
 
     pub fn strike(&self) -> Option<f64> {
@@ -753,31 +891,111 @@ impl GapSwingEngine {
     }
 
     pub fn is_flat(&self) -> bool {
-        true
+        self.unpaired_shares() <= 1e-12
+    }
+
+    pub fn unpaired_shares(&self) -> f64 {
+        self.commits
+            .iter()
+            .map(|c| (c.shares - c.paired).max(0.0))
+            .sum()
+    }
+
+    pub fn unpaired_on(&self, side: PositionSide) -> f64 {
+        self.commits
+            .iter()
+            .filter(|c| c.side == side)
+            .map(|c| (c.shares - c.paired).max(0.0))
+            .sum()
+    }
+
+    /// True once any live/dry fill was committed this window.
+    pub fn has_fills(&self) -> bool {
+        !self.commits.is_empty()
+    }
+
+    /// After a live/dry buy fill — lock inventory for re-sim (raw: no 2nd first-leg).
+    pub fn commit_buy(
+        &mut self,
+        side: PositionSide,
+        shares: f64,
+        fill: f64,
+        fill_t: i64,
+        is_pair: bool,
+        anchor_d: f64,
+    ) {
+        self.commits.push(CommittedLot {
+            side,
+            shares,
+            fill,
+            fill_t,
+            paired: 0.0,
+            anchor_d,
+            from_trough: side == PositionSide::Up,
+        });
+        if is_pair {
+            self.pair_commits(fill_t);
+        }
+    }
+
+    /// After flatten sell fill — mark side as closed.
+    pub fn commit_sell(&mut self, side: PositionSide) {
+        for c in &mut self.commits {
+            if c.side == side {
+                c.paired = c.shares;
+            }
+        }
+    }
+
+    fn pair_commits(&mut self, _t: i64) {
+        loop {
+            let up = self
+                .commits
+                .iter()
+                .position(|c| c.side == PositionSide::Up && c.shares - c.paired > 1e-12);
+            let dn = self
+                .commits
+                .iter()
+                .position(|c| c.side == PositionSide::Down && c.shares - c.paired > 1e-12);
+            let (Some(ui), Some(di)) = (up, dn) else {
+                break;
+            };
+            let q = (self.commits[ui].shares - self.commits[ui].paired)
+                .min(self.commits[di].shares - self.commits[di].paired);
+            if q <= 0.0 {
+                break;
+            }
+            self.commits[ui].paired += q;
+            self.commits[di].paired += q;
+        }
     }
 
     pub fn on_binance(&mut self, t: i64, price: f64) -> Vec<BotAction> {
         if !(price > 0.0) {
             return vec![];
         }
-        self.btc.push((t, price));
-        if self.ptb.is_none() {
-            self.ptb = Some(price);
+        if self.btc.last().is_some_and(|(lt, lp)| *lt == t && (*lp - price).abs() < 1e-9) {
+            return vec![];
         }
+        self.btc.push((t, price));
         self.refresh(t);
         self.take_pending()
     }
 
     pub fn on_coinbase(&mut self, t: i64, price: f64) -> Option<BotAction> {
-        if self.ptb.is_none() && price > 0.0 {
-            self.ptb = Some(price);
-        }
-        let _ = t;
+        let _ = (t, price);
         None
     }
 
     pub fn on_asks(&mut self, t: i64, up: f64, down: f64) {
         if up > 0.0 && down > 0.0 {
+            if self
+                .asks
+                .last()
+                .is_some_and(|(lt, _, _)| *lt == t)
+            {
+                return;
+            }
             self.asks.push((t, up, down));
         }
     }
@@ -790,7 +1008,7 @@ impl GapSwingEngine {
 
     /// Final window close — emit any remaining intents with known winner for settle PnL tracking.
     pub fn finalize(&mut self, winner: Option<PositionSide>) -> WindowResult {
-        let res = run_window(
+        let res = run_window_with_commits(
             self.open_ms,
             self.end_ms,
             self.ptb,
@@ -800,6 +1018,7 @@ impl GapSwingEngine {
             self.shares,
             Some(self.end_ms),
             self.taker_delay_ms,
+            &self.commits,
         );
         self.last_pnl = res.total_pnl;
         self.last_pairs = res.pairs;
@@ -808,7 +1027,7 @@ impl GapSwingEngine {
 
     fn refresh(&mut self, now_ms: i64) {
         let end = self.end_ms.min(now_ms + 1);
-        let res = run_window(
+        let res = run_window_with_commits(
             self.open_ms,
             end,
             self.ptb,
@@ -818,6 +1037,7 @@ impl GapSwingEngine {
             self.shares,
             Some(self.end_ms),
             self.taker_delay_ms,
+            &self.commits,
         );
         self.last_pnl = res.total_pnl;
         self.last_pairs = res.pairs;
@@ -826,12 +1046,15 @@ impl GapSwingEngine {
             if tr.kind != "BUY" && tr.kind != "SELL" {
                 continue;
             }
-            // With delay=0, signal_t == fill_t (immediate). Dry: signal is 250ms before fill.
-            let signal_t = tr.t - self.taker_delay_ms;
-            if signal_t > now_ms {
+            // Live delay=0: fire as soon as signal exists (tr.t == signal).
+            // Dry delay=250: emit at fill time so dry PnL matches poly-history.
+            if tr.t > now_ms {
                 continue;
             }
-            let key = if tr.kind == "SELL" {
+            let signal_t = tr.t - self.taker_delay_ms;
+            let key = if tr.reason.starts_with("EARLY_")
+                || tr.reason.starts_with("EMERGENCY")
+            {
                 format!("{}:{:?}:{}", tr.kind, tr.side, tr.reason)
             } else {
                 format!("{}:{:?}:{}:{}", tr.kind, tr.side, tr.t, tr.reason)
@@ -839,10 +1062,29 @@ impl GapSwingEngine {
             if !self.emitted.insert(key) {
                 continue;
             }
-            let worst = clamp_price(tr.fill + 0.02);
+
             let second = tr.reason.contains("_2")
                 || tr.reason.starts_with("EARLY_")
                 || tr.reason.starts_with("EMERGENCY");
+
+            // Raw inventory rules (same as poly-history): no first-leg while unpaired.
+            if tr.kind == "BUY" && !second && self.unpaired_shares() > 1e-12 {
+                continue;
+            }
+            if tr.kind == "BUY"
+                && second
+                && self.unpaired_on(match tr.side {
+                    PositionSide::Up => PositionSide::Down,
+                    PositionSide::Down => PositionSide::Up,
+                }) <= 1e-12
+            {
+                continue;
+            }
+            if tr.kind == "SELL" && self.unpaired_on(tr.side) <= 1e-12 {
+                continue;
+            }
+
+            let worst = clamp_price(tr.fill + 0.02);
             let action = if tr.kind == "SELL" {
                 BotAction::SellFlatten {
                     side: tr.side,
@@ -882,7 +1124,7 @@ impl GapSwingEngine {
         }
     }
 
-    fn take_pending(&mut self) -> Vec<BotAction> {
+    pub fn take_pending(&mut self) -> Vec<BotAction> {
         std::mem::take(&mut self.pending)
     }
 }

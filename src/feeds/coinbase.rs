@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::watch;
+use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
@@ -10,8 +10,8 @@ use super::binance::BtcQuote;
 
 const COINBASE_WS: &str = "wss://ws-feed.exchange.coinbase.com";
 
-pub fn spawn_coinbase() -> watch::Receiver<Option<BtcQuote>> {
-    let (tx, rx) = watch::channel(None);
+pub fn spawn_coinbase() -> mpsc::UnboundedReceiver<BtcQuote> {
+    let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut backoff = Duration::from_secs(1);
         loop {
@@ -25,7 +25,7 @@ pub fn spawn_coinbase() -> watch::Receiver<Option<BtcQuote>> {
     rx
 }
 
-async fn run(tx: &watch::Sender<Option<BtcQuote>>) -> Result<()> {
+async fn run(tx: &mpsc::UnboundedSender<BtcQuote>) -> Result<()> {
     let (ws, _) = connect_async(COINBASE_WS).await?;
     info!("coinbase connected");
     let (mut write, mut read) = ws.split();
@@ -66,7 +66,9 @@ async fn run(tx: &watch::Sender<Option<BtcQuote>>) -> Result<()> {
             continue;
         }
         let t = now_ms();
-        tx.send_replace(Some(BtcQuote { t, price }));
+        if tx.send(BtcQuote { t, price }).is_err() {
+            break;
+        }
     }
 
     warn!("coinbase disconnected");
