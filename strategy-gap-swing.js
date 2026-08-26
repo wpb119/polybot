@@ -1,4 +1,9 @@
 /**
+ * STALE COPY — do not use for trading.
+ * Live + dry engine is src/strategy/gap_swing.rs, matching
+ * poly-history/new_strategy/strategy-gap-swing-rust-agent.js
+ * (first ask 12–78¢, restart ≥45s left, flatten T−25s).
+ *
  * GAP SWING — BTC 5m Up/Down major-swing gap capture
  *
  * Portable copy of poly-history web/src/gapCapture.ts (mode=raw).

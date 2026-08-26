@@ -1,6 +1,6 @@
-//! Gap-swing engine — port of poly-history raw gapCapture.
-//! Dry/backtest: t+250ms fill model (same as poly-history).
-//! Live: taker_delay=0 — fire and post as soon as the swing/pair signal is captured.
+//! Gap-swing engine — poly-history best PnL (`strategy-gap-swing-rust-agent.js`).
+//! Same buy pattern: peak→DOWN, trough→UP, early opp $30, pair net≥0, flatten T−25s.
+//! Dry/backtest: t+250ms fill (matches poly-history). Live: delay=0, post at signal.
 
 use std::collections::HashSet;
 
@@ -15,10 +15,11 @@ pub const TICK_MS: i64 = 500;
 
 pub const MIN_SWING_USD: f64 = 40.0;
 pub const CONFIRM_USD: f64 = 10.0;
-pub const MAX_CHEAP_ASK: f64 = 0.60;
+pub const MAX_CHEAP_ASK: f64 = 0.78;
 pub const MAX_SECOND_ASK: f64 = 0.76;
 pub const MAX_EARLY_OPP_ASK: f64 = 0.88;
-pub const MIN_ASK: f64 = 0.05;
+pub const MIN_ASK: f64 = 0.04;
+pub const MIN_FIRST_ASK: f64 = 0.12;
 pub const MIN_PEAK_DELTA: f64 = 40.0;
 pub const MAX_TROUGH_DELTA: f64 = 52.0;
 pub const EARLY_OPP_SWING_USD: f64 = 30.0;
@@ -26,6 +27,9 @@ pub const MIN_UP_FIRST_DELTA: f64 = -75.0;
 pub const RAPID_FALL_USD: f64 = 55.0;
 pub const RAPID_FALL_MS: i64 = 12_000;
 pub const MIN_LEFT_MS: i64 = 10_000;
+pub const RESTART_MIN_LEFT_MS: i64 = 45_000;
+pub const PAIR_COOLDOWN_MS: i64 = 8_000;
+pub const FIRST_COOLDOWN_MS: i64 = 400;
 pub const MAX_PAIRS: u32 = 16;
 pub const DELAY_BUFFER_PER_LEG: f64 = 0.005;
 pub const MIN_RAW_PAIR_NET: f64 = 0.0;
@@ -58,6 +62,8 @@ pub struct SimTrade {
     pub shares: f64,
     pub reason: String,
     pub net: f64,
+    /// First-leg extreme Δ (or first-leg anchor for flips). Used for live commit.
+    pub anchor_d: f64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -93,7 +99,7 @@ pub struct CommittedLot {
     pub from_trough: bool,
 }
 
-/// Exact batch sim matching `strategy-gap-swing.js` runWindow (mode=raw).
+/// Exact batch sim matching poly-history `strategy-gap-swing-rust-agent.js` `runWindow`.
 ///
 /// `end_ms` is the sim horizon (live may truncate to now). Pass `market_end_ms`
 /// as the real window close so emergency flatten stays fixed at
@@ -101,6 +107,49 @@ pub struct CommittedLot {
 /// a moving truncated end re-fires flatten every tick.
 ///
 /// `taker_delay_ms`: dry/backtest use 250 (fill at t+250). Live use **0** (post now).
+
+/// Replay commits in fill order to recover `nextTradeT` after last fill
+/// (`+PAIR_COOLDOWN_MS` if that fill completed a pair, else `+FIRST_COOLDOWN_MS`).
+fn next_trade_t_from_commits(commits: &[CommittedLot], shares: f64, open_ms: i64) -> i64 {
+    if commits.is_empty() || shares <= 0.0 {
+        return open_ms;
+    }
+    let mut ordered: Vec<&CommittedLot> = commits.iter().collect();
+    ordered.sort_by_key(|c| c.fill_t);
+    let mut sides: Vec<(PositionSide, f64)> = Vec::new(); // remaining unpaired
+    let mut pairs_done: u32 = 0;
+    let mut next_t = open_ms;
+    for c in ordered {
+        sides.push((c.side, c.shares));
+        let before = pairs_done;
+        loop {
+            let up_i = sides
+                .iter()
+                .position(|(s, q)| *s == PositionSide::Up && *q > 1e-12);
+            let dn_i = sides
+                .iter()
+                .position(|(s, q)| *s == PositionSide::Down && *q > 1e-12);
+            let (Some(ui), Some(di)) = (up_i, dn_i) else {
+                break;
+            };
+            let q = sides[ui].1.min(sides[di].1);
+            if q <= 0.0 {
+                break;
+            }
+            sides[ui].1 -= q;
+            sides[di].1 -= q;
+            pairs_done += 1;
+        }
+        next_t = if pairs_done > before {
+            c.fill_t + PAIR_COOLDOWN_MS
+        } else {
+            c.fill_t + FIRST_COOLDOWN_MS
+        };
+    }
+    let _ = shares;
+    next_t
+}
+
 pub fn run_window(
     open_ms: i64,
     end_ms: i64,
@@ -183,12 +232,8 @@ pub fn run_window_with_commits(
         }
     }
     let mut missed: u32 = 0;
-    let mut next_trade_t = commits
-        .iter()
-        .map(|c| c.fill_t)
-        .max()
-        .map(|t| t + 400)
-        .unwrap_or(open_ms);
+    // Raw: after each fill, nextTradeT = fill+8000 if that fill completed a pair, else +400.
+    let mut next_trade_t = next_trade_t_from_commits(commits, shares, open_ms);
     let mut anchor: Option<(i64, f64, PositionSide, ExtKind)> = commits
         .iter()
         .rev()
@@ -243,6 +288,7 @@ pub fn run_window_with_commits(
                 shares: q,
                 reason: "pair".into(),
                 net,
+                anchor_d: 0.0,
             });
         }
     };
@@ -294,13 +340,14 @@ pub fn run_window_with_commits(
             shares,
             reason: tag.into(),
             net: 0.0,
+            anchor_d,
         });
         let before = *pairs;
         pair_lots(lots, trades, fill_t, pairs);
         *next_t = if *pairs > before {
-            fill_t + 8_000
+            fill_t + PAIR_COOLDOWN_MS
         } else {
-            fill_t + 400
+            fill_t + FIRST_COOLDOWN_MS
         };
         if !is_flip {
             *anchor_ref = Some((fill_t, anchor_d, side, ext_kind));
@@ -458,8 +505,14 @@ pub fn run_window_with_commits(
                 if unpaired_shares(&lots) > 0.0 {
                     continue;
                 }
-                // first leg
-                if sw.ask > MAX_CHEAP_ASK || sw.ask < 0.12 {
+                // first leg — same gates as poly-history best engine
+                if market_end - sw.t < MIN_LEFT_MS {
+                    continue;
+                }
+                if pairs_done > 0 && market_end - sw.t < RESTART_MIN_LEFT_MS {
+                    continue;
+                }
+                if sw.ask > MAX_CHEAP_ASK || sw.ask < MIN_FIRST_ASK {
                     continue;
                 }
                 if sw.kind == ExtKind::Trough && sw.side == PositionSide::Up {
@@ -545,6 +598,7 @@ pub fn run_window_with_commits(
                         shares: q,
                         reason: "flatten".into(),
                         net: q * px - (q * lots[i].fill + fee_buy) - fee_s,
+                        anchor_d: 0.0,
                     });
                 }
             }
@@ -586,6 +640,7 @@ pub fn run_window_with_commits(
             shares: q,
             reason: "settle".into(),
             net: q * mark - (q * lot.fill + fee_buy),
+            anchor_d: 0.0,
         });
     }
 
@@ -872,10 +927,16 @@ impl GapSwingEngine {
         self.taker_delay_ms = delay_ms.max(0);
     }
 
-    pub fn set_strike(&mut self, ptb: f64) {
+    /// One-shot official PTB. First lock wins; later RTDS/REST ticks never overwrite.
+    pub fn set_strike(&mut self, ptb: f64) -> bool {
+        if self.ptb.is_some() {
+            return false;
+        }
         if ptb > 0.0 {
             self.ptb = Some(ptb);
+            return true;
         }
+        false
     }
 
     pub fn strike(&self) -> Option<f64> {
@@ -909,6 +970,10 @@ impl GapSwingEngine {
             .sum()
     }
 
+    pub fn fill_count(&self) -> usize {
+        self.commits.len()
+    }
+
     /// True once any live/dry fill was committed this window.
     pub fn has_fills(&self) -> bool {
         !self.commits.is_empty()
@@ -924,6 +989,19 @@ impl GapSwingEngine {
         is_pair: bool,
         anchor_d: f64,
     ) {
+        // EARLY_OPP measures Δ travel from first-leg anchor. Callers often pass 0 —
+        // recover open-Δ at signal (or fill) from the live BTC tape.
+        let anchor_d = if anchor_d.abs() > 1e-6 {
+            anchor_d
+        } else if let Some(ptb) = self.ptb {
+            let sig_t = (fill_t - self.taker_delay_ms).max(self.open_ms);
+            px_at(&self.btc, sig_t)
+                .or_else(|| px_at(&self.btc, fill_t))
+                .map(|px| px - ptb)
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
         self.commits.push(CommittedLot {
             side,
             shares,
@@ -1052,22 +1130,12 @@ impl GapSwingEngine {
                 continue;
             }
             let signal_t = tr.t - self.taker_delay_ms;
-            let key = if tr.reason.starts_with("EARLY_")
-                || tr.reason.starts_with("EMERGENCY")
-            {
-                format!("{}:{:?}:{}", tr.kind, tr.side, tr.reason)
-            } else {
-                format!("{}:{:?}:{}:{}", tr.kind, tr.side, tr.t, tr.reason)
-            };
-            if !self.emitted.insert(key) {
-                continue;
-            }
-
             let second = tr.reason.contains("_2")
                 || tr.reason.starts_with("EARLY_")
                 || tr.reason.starts_with("EMERGENCY");
 
-            // Raw inventory rules (same as poly-history): no first-leg while unpaired.
+            // Inventory checks BEFORE burning emitted keys (Raw never "uses up"
+            // a swing that inventory rejected).
             if tr.kind == "BUY" && !second && self.unpaired_shares() > 1e-12 {
                 continue;
             }
@@ -1082,6 +1150,32 @@ impl GapSwingEngine {
             }
             if tr.kind == "SELL" && self.unpaired_on(tr.side) <= 1e-12 {
                 continue;
+            }
+
+            let key = if tr.reason.starts_with("EARLY_")
+                || tr.reason.starts_with("EMERGENCY")
+            {
+                format!("{}:{:?}:{}", tr.kind, tr.side, tr.reason)
+            } else {
+                format!("{}:{:?}:{}:{}", tr.kind, tr.side, tr.t, tr.reason)
+            };
+            if !self.emitted.insert(key) {
+                continue;
+            }
+
+            // Optimistic commit NOW — dry fills / order ACKs lag across the BN
+            // drain, and Raw updates lots immediately inside addLot.
+            if tr.kind == "BUY" {
+                self.commit_buy(
+                    tr.side,
+                    tr.shares,
+                    tr.fill,
+                    tr.t,
+                    second,
+                    tr.anchor_d,
+                );
+            } else if tr.kind == "SELL" {
+                self.commit_sell(tr.side);
             }
 
             let worst = clamp_price(tr.fill + 0.02);

@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
                 "BTC BN+CB impulse, pullback entry, pair exit"
             }
             polybot::config::StrategyKind::GapSwing => {
-                "major-swing gap capture peak→DOWN / trough→UP + early opposite"
+                "poly-history best PnL: peak→DOWN / trough→UP, pair net≥0, flatten T−25s"
             }
         }
     );

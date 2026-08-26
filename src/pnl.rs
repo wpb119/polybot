@@ -22,12 +22,18 @@ pub struct WindowClose {
 
 struct WindowLedger {
     slug: String,
-    shares: f64,
     fees: f64,
-    cost: f64,
-    entry_side: Option<PositionSide>,
-    paired: bool,
+    buy_cost: f64,
+    sell_proceeds: f64,
+    paired_payout: f64,
     legs: u32,
+    lots: Vec<OpenLot>,
+}
+
+#[derive(Clone, Debug)]
+struct OpenLot {
+    side: PositionSide,
+    remaining: f64,
 }
 
 pub struct PnlTracker {
@@ -47,39 +53,35 @@ impl PnlTracker {
         &self.totals
     }
 
-    pub fn open_window(&mut self, slug: String, shares: f64) {
+    pub fn open_window(&mut self, slug: String, _shares: f64) {
         self.window = Some(WindowLedger {
             slug,
-            shares,
             ..Default::default()
         });
     }
 
     /// `fill_px` is the actual CLOB fill (live) or dry-run modeled fill.
-    pub fn record_buy(&mut self, side: PositionSide, fill_px: f64, shares: f64, is_pair: bool) {
+    pub fn record_buy(&mut self, side: PositionSide, fill_px: f64, shares: f64, _is_pair: bool) {
         let w = self.window.as_mut().expect("window ledger");
         let fee = taker_fee_usdc(shares, fill_px);
-        let cost = shares * fill_px + fee;
         w.fees += fee;
-        w.cost += cost;
+        w.buy_cost += shares * fill_px;
         w.legs += 1;
-        if is_pair {
-            w.paired = true;
-        } else {
-            w.entry_side = Some(side);
-        }
+        w.lots.push(OpenLot {
+            side,
+            remaining: shares,
+        });
+        w.pair_open_lots();
     }
 
     /// Flatten sell proceeds (gap-swing emergency exit).
-    pub fn record_sell(&mut self, _side: PositionSide, fill_px: f64, shares: f64) {
+    pub fn record_sell(&mut self, side: PositionSide, fill_px: f64, shares: f64) {
         let w = self.window.as_mut().expect("window ledger");
         let fee = taker_fee_usdc(shares, fill_px);
         w.fees += fee;
-        // Proceeds reduce net cost; mark as paired so we don't settle the token again.
-        w.cost -= shares * fill_px - fee;
-        w.paired = true;
+        w.sell_proceeds += shares * fill_px;
         w.legs += 1;
-        w.entry_side = None;
+        w.close_lots(side, shares);
     }
 
     pub fn close_window(&mut self, winner: Option<PositionSide>) -> Option<WindowClose> {
@@ -88,20 +90,16 @@ impl PnlTracker {
             return None;
         }
 
-        let payout = if w.paired {
-            w.shares
-        } else if let Some(entry) = w.entry_side {
-            if winner == Some(entry) {
-                w.shares
-            } else {
-                0.0
-            }
-        } else {
-            0.0
-        };
+        let settle_payout: f64 = w
+            .lots
+            .iter()
+            .filter(|lot| Some(lot.side) == winner)
+            .map(|lot| lot.remaining)
+            .sum();
+        let payout = w.paired_payout + w.sell_proceeds + settle_payout;
 
-        let gross = payout - (w.cost - w.fees);
-        let net = payout - w.cost;
+        let gross = payout - w.buy_cost;
+        let net = gross - w.fees;
 
         self.totals.fees += w.fees;
         self.totals.net += net;
@@ -116,14 +114,17 @@ impl PnlTracker {
         })
     }
 
-    pub fn log_window_close(&self, close: &WindowClose) {
+    pub fn add_window_net(&mut self, slug: &str, net: f64, pairs: u32, n_trades: usize) {
+        self.window = None;
+        self.totals.net += net;
+        self.totals.gross += net;
         info!(
-            "── window finished {} ── net ${:.2} | gross ${:.2} | fees ${:.2} | legs {}",
-            close.slug, close.net, close.gross, close.fees, close.legs
+            "── window finished {slug} ── net ${:.2} | pairs {pairs} | trades {n_trades}",
+            net
         );
         info!(
-            "── session total ── net ${:.2} | gross ${:.2} | fees ${:.2}",
-            self.totals.net, self.totals.gross, self.totals.fees
+            "── session total ── net ${:.2}",
+            self.totals.net
         );
     }
 }
@@ -132,12 +133,48 @@ impl Default for WindowLedger {
     fn default() -> Self {
         Self {
             slug: String::new(),
-            shares: 0.0,
             fees: 0.0,
-            cost: 0.0,
-            entry_side: None,
-            paired: false,
+            buy_cost: 0.0,
+            sell_proceeds: 0.0,
+            paired_payout: 0.0,
             legs: 0,
+            lots: Vec::new(),
+        }
+    }
+}
+
+impl WindowLedger {
+    fn pair_open_lots(&mut self) {
+        loop {
+            let up = self
+                .lots
+                .iter()
+                .position(|lot| lot.side == PositionSide::Up && lot.remaining > 1e-12);
+            let down = self
+                .lots
+                .iter()
+                .position(|lot| lot.side == PositionSide::Down && lot.remaining > 1e-12);
+            let (Some(up), Some(down)) = (up, down) else {
+                break;
+            };
+            let q = self.lots[up].remaining.min(self.lots[down].remaining);
+            if q <= 0.0 {
+                break;
+            }
+            self.lots[up].remaining -= q;
+            self.lots[down].remaining -= q;
+            self.paired_payout += q;
+        }
+    }
+
+    fn close_lots(&mut self, side: PositionSide, mut shares: f64) {
+        for lot in &mut self.lots {
+            if lot.side != side || shares <= 1e-12 {
+                continue;
+            }
+            let q = lot.remaining.min(shares);
+            lot.remaining -= q;
+            shares -= q;
         }
     }
 }

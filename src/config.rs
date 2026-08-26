@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 pub enum StrategyKind {
     /// Historical pairing (impulse START + pullback + pair exit).
     Pairing,
-    /// Major-swing gap capture (peak→DOWN / trough→UP + early opposite).
+    /// Poly-history best PnL gap-swing (peak→DOWN / trough→UP + pair + T−25s flatten).
     GapSwing,
 }
 

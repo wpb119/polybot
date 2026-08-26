@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use crate::strategy::PositionSide;
 
 pub const TAKER_DELAY_MS: i64 = 250;
-pub const PRE_SUBSCRIBE_MS: i64 = 5_000;
+/// Always keep current + next window on the WS so the next book is warm before UTC open
+/// (avoids T-5s resubscribe blackout that missed early buys).
+pub const PRE_SUBSCRIBE_MS: i64 = 300_000;
 
 #[derive(Clone, Debug, Default)]
 pub struct MarketQuotes {
@@ -32,7 +34,8 @@ impl PolyBook {
         }
         let w = self.windows.entry(start_ts).or_default();
         w.push((t, up, down));
-        let cutoff = t - 15_000;
+        // Keep enough history to seed the engine at window open (pre-open asks).
+        let cutoff = t - 120_000;
         while w.first().is_some_and(|(pt, _, _)| *pt < cutoff) {
             w.remove(0);
         }
@@ -48,6 +51,11 @@ impl PolyBook {
 
     pub fn latest(&self, start_ts: i64) -> Option<MarketQuotes> {
         self.latest.get(&start_ts).cloned()
+    }
+
+    /// Ask tape for a window (for seeding gap-swing at open).
+    pub fn history(&self, start_ts: i64) -> Vec<(i64, f64, f64)> {
+        self.windows.get(&start_ts).cloned().unwrap_or_default()
     }
 
     pub fn ask_before(&self, start_ts: i64, t: i64, side: PositionSide) -> Option<f64> {
@@ -74,16 +82,13 @@ impl PolyBook {
     }
 }
 
-/// Which window(s) to subscribe on Polymarket WS.
+/// Which window(s) to subscribe on Polymarket WS — always current + next so next
+/// market asks are live for the full prior window (no late subscribe at T-5s).
 pub fn subscribe_window_starts(now_ms: i64) -> Vec<i64> {
     let now_sec = now_ms / 1000;
     let current = (now_sec / 300) * 300;
     let next = current + 300;
-    if now_sec + PRE_SUBSCRIBE_MS / 1000 >= next {
-        vec![current, next]
-    } else {
-        vec![current]
-    }
+    vec![current, next]
 }
 
 /// Active trading window (only after UTC open).
