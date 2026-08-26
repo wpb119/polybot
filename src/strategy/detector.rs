@@ -207,7 +207,12 @@ impl TrendDetector {
         }
 
         let direction = if s > 0 { Side::Up } else { Side::Down };
-        self.last_quality_ms = tick_t;
+        let long_enough = tick_t - self.last_fire_ms >= 18_000;
+        if let Some(trend_dir) = self.trend {
+            if trend_dir != direction && (both_venues || long_enough) {
+                self.trend = None;
+            }
+        }
 
         if self.trend == Some(direction) {
             return None;
@@ -218,6 +223,8 @@ impl TrendDetector {
         if self.start_count >= MAX_CAPTURES {
             return None;
         }
+
+        self.last_quality_ms = tick_t;
 
         let seconds_left = ((self.end_ms - tick_t) as f64 / 1000.0).max(1.0);
         let gap_usd = n - self.strike.unwrap_or(n);

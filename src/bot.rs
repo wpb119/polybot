@@ -20,6 +20,7 @@ use crate::poly_book::{
 };
 use crate::strategy::{
     BotAction, CaptureSignal, GapSwingEngine, PairingEngine, PositionSide, TrendDetector,
+    VenueSwingEngine, VENUE_TAKER_DELAY_MS,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -45,6 +46,9 @@ enum ActiveEngine {
     },
     GapSwing {
         engine: GapSwingEngine,
+    },
+    VenueSwing {
+        engine: VenueSwingEngine,
     },
 }
 
@@ -110,6 +114,17 @@ impl Bot {
                 engine.set_shares(cfg.order_shares);
                 ActiveEngine::GapSwing { engine }
             }
+            StrategyKind::VenueSwing => {
+                let mut engine = VenueSwingEngine::new(open_ms, end_ms);
+                // Live: fire at signal (delay 0). Dry/backtest: t+70 like poly-history.
+                engine.set_taker_delay_ms(if cfg.live_trading {
+                    0
+                } else {
+                    VENUE_TAKER_DELAY_MS
+                });
+                engine.set_shares(cfg.order_shares);
+                ActiveEngine::VenueSwing { engine }
+            }
         };
 
         Ok(Self {
@@ -143,12 +158,19 @@ impl Bot {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        let tape_desc = match self.cfg.strategy {
+            StrategyKind::VenueSwing => {
+                "tape=binance+coinbase Δ=venue−venue_open (union zigzags; PTB = winner only)"
+            }
+            _ => "tape=binance Δ=Binance−locked_PTB strike=RTDS-crypto_prices_twap_sixty",
+        };
         info!(
-            "polybot starting strategy={} live_trading={} shares={} poly_sub=current+next taker_delay={}ms tape=binance Δ=Binance−locked_PTB strike=RTDS-crypto_prices_twap_sixty (REST openPrice 60s TWAP fallback after 8s; first lock wins)",
+            "polybot starting strategy={} live_trading={} shares={} poly_sub=current+next taker_delay={}ms {} (REST openPrice 60s TWAP fallback after 8s; first lock wins)",
             self.cfg.strategy.label(),
             self.cfg.live_trading,
             self.cfg.order_shares,
-            if self.cfg.live_trading { 0 } else { TAKER_DELAY_MS },
+            if self.cfg.live_trading { 0 } else { self.dry_delay_ms() },
+            tape_desc,
         );
         if let Err(e) = self.orders.init_live(&self.cfg).await {
             error!("CLOB init: {:#}", e);
@@ -191,6 +213,14 @@ impl Bot {
         }
     }
 
+    /// Dry-fill latency per strategy (venue-swing sims at t+70, others t+250).
+    fn dry_delay_ms(&self) -> i64 {
+        match self.cfg.strategy {
+            StrategyKind::VenueSwing => VENUE_TAKER_DELAY_MS,
+            _ => TAKER_DELAY_MS,
+        }
+    }
+
     fn drain_poly_quotes(&mut self) {
         while let Ok(p) = self.poly_rx.try_recv() {
             if self.subscribed_starts.contains(&p.start_ts) {
@@ -217,11 +247,12 @@ impl Bot {
         out
     }
 
-    /// Drain RTDS 60s TWAP. First tick at/after window open locks strike once, then trade.
+    /// Drain RTDS 60s TWAP. Gap-swing: first tick at/after open locks strike, then trade.
+    /// Venue-swing: same lock, but only for winner resolution (never gates trading).
     async fn drain_rtds_and_maybe_lock_strike(&mut self) {
         while let Ok(q) = self.cl_rx.try_recv() {
             self.last_cl = Some((q.t, q.price));
-            if !matches!(self.cfg.strategy, StrategyKind::GapSwing) {
+            if matches!(self.cfg.strategy, StrategyKind::Pairing) {
                 continue;
             }
             let Some(start) = self.trading_start_ts else {
@@ -237,6 +268,7 @@ impl Bot {
     fn gap_ptb_locked(&self) -> bool {
         match &self.active {
             ActiveEngine::GapSwing { engine } => engine.strike().is_some(),
+            ActiveEngine::VenueSwing { engine } => engine.strike().is_some(),
             _ => false,
         }
     }
@@ -244,13 +276,16 @@ impl Bot {
     async fn try_lock_gap_ptb(&mut self, start: i64, ptb: f64, src: &str) {
         if self.gap_ptb_locked() {
             if src.starts_with("rest") {
-                if let ActiveEngine::GapSwing { engine } = &self.active {
-                    if let Some(have) = engine.strike() {
-                        info!(
-                            "REST openPrice ignored (PTB already locked) rest={:.2} have={:.2}",
-                            ptb, have
-                        );
-                    }
+                let have = match &self.active {
+                    ActiveEngine::GapSwing { engine } => engine.strike(),
+                    ActiveEngine::VenueSwing { engine } => engine.strike(),
+                    _ => None,
+                };
+                if let Some(have) = have {
+                    info!(
+                        "REST openPrice ignored (PTB already locked) rest={:.2} have={:.2}",
+                        ptb, have
+                    );
                 }
             }
             return;
@@ -265,21 +300,26 @@ impl Bot {
             .map(|q| (q.up_ask, q.down_ask))
             .unwrap_or((0.0, 0.0));
         let now = now_ms();
-        let locked = if let ActiveEngine::GapSwing { engine } = &mut self.active {
-            engine.set_strike(ptb)
-        } else {
-            false
+        let locked = match &mut self.active {
+            ActiveEngine::GapSwing { engine } => engine.set_strike(ptb),
+            ActiveEngine::VenueSwing { engine } => engine.set_strike(ptb),
+            _ => false,
         };
         if !locked {
             return;
         }
         self.ptb_locked.store(true, Ordering::Relaxed);
         self.ptb_cache.insert(start, ptb);
-        info!(ptb, "official PTB locked; Δ = Binance − PTB");
-        let actions = if let ActiveEngine::GapSwing { engine } = &mut self.active {
-            engine.tick(now, up, down)
-        } else {
-            vec![]
+        match self.cfg.strategy {
+            StrategyKind::VenueSwing => {
+                info!(ptb, "official PTB locked (winner resolution only; Δ = venue − venue open)")
+            }
+            _ => info!(ptb, "official PTB locked; Δ = Binance − PTB"),
+        }
+        let actions = match &mut self.active {
+            ActiveEngine::GapSwing { engine } => engine.tick(now, up, down),
+            ActiveEngine::VenueSwing { engine } => engine.tick(now, up, down),
+            _ => vec![],
         };
         if self.can_trade(now) {
             if let Some(m) = self.trading_market.clone() {
@@ -294,13 +334,15 @@ impl Bot {
         match self.cfg.strategy {
             StrategyKind::Pairing => self.drive_pairing(now).await,
             StrategyKind::GapSwing => self.drive_gap_swing(now).await,
+            StrategyKind::VenueSwing => self.drive_venue_swing(now).await,
         }
     }
 
     async fn drive_pairing(&mut self, now: i64) {
         if let Some(m) = self.trading_market.clone() {
             if let Some(quotes) = self.poly_book.latest(m.start_ts) {
-                if let ActiveEngine::Pairing { detector, .. } = &mut self.active {
+                if let ActiveEngine::Pairing { detector, engine } = &mut self.active {
+                    engine.record_poly(quotes.t, quotes.up_ask, quotes.down_ask);
                     detector.push_poly(quotes.t, quotes.up_ask, quotes.down_ask);
                 }
             }
@@ -393,31 +435,42 @@ impl Bot {
     }
 
     fn maybe_log_tape(&mut self, now: i64) {
-        if !matches!(self.cfg.strategy, StrategyKind::GapSwing) {
-            return;
-        }
         if now.saturating_sub(self.last_tape_log_ms) < 15_000 {
             return;
         }
-        self.last_tape_log_ms = now;
-        let ActiveEngine::GapSwing { engine } = &self.active else {
-            return;
-        };
-        let delta = match (self.last_bn, engine.strike()) {
-            (Some(bn), Some(ptb)) => Some(bn - ptb),
-            _ => None,
-        };
-        info!(
-            delta = ?delta,
-            fills = engine.fill_count(),
-            unpaired = engine.unpaired_shares(),
-            pairs = engine.last_pairs(),
-            "tape"
-        );
+        match &self.active {
+            ActiveEngine::GapSwing { engine } => {
+                self.last_tape_log_ms = now;
+                let delta = match (self.last_bn, engine.strike()) {
+                    (Some(bn), Some(ptb)) => Some(bn - ptb),
+                    _ => None,
+                };
+                info!(
+                    delta = ?delta,
+                    fills = engine.fill_count(),
+                    unpaired = engine.unpaired_shares(),
+                    pairs = engine.last_pairs(),
+                    "tape"
+                );
+            }
+            ActiveEngine::VenueSwing { engine } => {
+                self.last_tape_log_ms = now;
+                let (bn_d, cb_d) = engine.venue_deltas();
+                info!(
+                    bn_delta = ?bn_d,
+                    cb_delta = ?cb_d,
+                    fills = engine.fill_count(),
+                    unpaired = engine.unpaired_shares(),
+                    pairs = engine.last_pairs(),
+                    "tape"
+                );
+            }
+            _ => {}
+        }
     }
 
     fn ingest_gap_swing(&mut self) {
-        if !matches!(self.cfg.strategy, StrategyKind::GapSwing) {
+        if matches!(self.cfg.strategy, StrategyKind::Pairing) {
             return;
         }
         if self.can_trade(now_ms()) {
@@ -426,29 +479,50 @@ impl Bot {
         // Ingest asks for the *next* trading window too (warm book before UTC open).
         for start in &self.subscribed_starts.clone() {
             if let Some(quotes) = self.poly_book.latest(*start) {
-                if let ActiveEngine::GapSwing { engine } = &mut self.active {
-                    // Only push into engine if this is the active trading window;
-                    // otherwise poly_book already holds them for seed at open.
-                    if self.trading_start_ts == Some(*start) {
-                        engine.on_asks(quotes.t, quotes.up_ask, quotes.down_ask);
+                // Only push into engine if this is the active trading window;
+                // otherwise poly_book already holds them for seed at open.
+                if self.trading_start_ts == Some(*start) {
+                    match &mut self.active {
+                        ActiveEngine::GapSwing { engine } => {
+                            engine.on_asks(quotes.t, quotes.up_ask, quotes.down_ask);
+                        }
+                        ActiveEngine::VenueSwing { engine } => {
+                            engine.on_asks(quotes.t, quotes.up_ask, quotes.down_ask);
+                        }
+                        _ => {}
                     }
                 }
             }
         }
         for q in self.drain_bn_quotes() {
-            if let ActiveEngine::GapSwing { engine } = &mut self.active {
-                let _ = engine.on_binance(q.t, q.price);
-                engine.take_pending();
-            }
-        }
-        // Coinbase: Raw chart uses Binance BTC; use CB only if BN is silent.
-        let bn_fresh = self.last_bn.is_some();
-        for q in self.drain_cb_quotes() {
-            if !bn_fresh {
-                if let ActiveEngine::GapSwing { engine } = &mut self.active {
+            match &mut self.active {
+                ActiveEngine::GapSwing { engine } => {
                     let _ = engine.on_binance(q.t, q.price);
                     engine.take_pending();
                 }
+                ActiveEngine::VenueSwing { engine } => {
+                    let _ = engine.on_binance(q.t, q.price);
+                    engine.take_pending();
+                }
+                _ => {}
+            }
+        }
+        let bn_fresh = self.last_bn.is_some();
+        for q in self.drain_cb_quotes() {
+            match &mut self.active {
+                // Venue-swing: Coinbase is a first-class tape (its own open + zigzag).
+                ActiveEngine::VenueSwing { engine } => {
+                    let _ = engine.on_coinbase(q.t, q.price);
+                    engine.take_pending();
+                }
+                // Gap-swing chart uses Binance; CB fills gaps only when BN is silent.
+                ActiveEngine::GapSwing { engine } => {
+                    if !bn_fresh {
+                        let _ = engine.on_binance(q.t, q.price);
+                        engine.take_pending();
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -495,6 +569,54 @@ impl Bot {
             if let Some(quotes) = self.poly_book.latest(m.start_ts) {
                 let actions = match &mut self.active {
                     ActiveEngine::GapSwing { engine } => {
+                        engine.tick(now, quotes.up_ask, quotes.down_ask)
+                    }
+                    _ => vec![],
+                };
+                for action in actions {
+                    self.execute_action(&action, &m, now).await;
+                }
+            }
+        }
+    }
+
+    /// Venue-swing: BN and CB are both first-class tapes; no PTB wait.
+    async fn drive_venue_swing(&mut self, now: i64) {
+        if let Some(m) = self.trading_market.clone() {
+            if let Some(quotes) = self.poly_book.latest(m.start_ts) {
+                if let ActiveEngine::VenueSwing { engine } = &mut self.active {
+                    engine.on_asks(quotes.t, quotes.up_ask, quotes.down_ask);
+                }
+            }
+        }
+
+        for q in self.drain_bn_quotes() {
+            let actions = match &mut self.active {
+                ActiveEngine::VenueSwing { engine } => engine.on_binance(q.t, q.price),
+                _ => vec![],
+            };
+            if let Some(m) = self.trading_market.clone() {
+                for action in actions {
+                    self.execute_action(&action, &m, now).await;
+                }
+            }
+        }
+        for q in self.drain_cb_quotes() {
+            let actions = match &mut self.active {
+                ActiveEngine::VenueSwing { engine } => engine.on_coinbase(q.t, q.price),
+                _ => vec![],
+            };
+            if let Some(m) = self.trading_market.clone() {
+                for action in actions {
+                    self.execute_action(&action, &m, now).await;
+                }
+            }
+        }
+
+        if let Some(m) = self.trading_market.clone() {
+            if let Some(quotes) = self.poly_book.latest(m.start_ts) {
+                let actions = match &mut self.active {
+                    ActiveEngine::VenueSwing { engine } => {
                         engine.tick(now, quotes.up_ask, quotes.down_ask)
                     }
                     _ => vec![],
@@ -639,15 +761,24 @@ impl Bot {
             self.market_cache.insert(start_ts, market);
         }
         let market = self.market_cache[&start_ts].clone();
-        info!(
-            slug = %market.slug,
-            "window ready (Δ = Binance − official PTB)"
-        );
+        match self.cfg.strategy {
+            StrategyKind::VenueSwing => info!(
+                slug = %market.slug,
+                "window ready (Δ = BN−BN-open + CB−CB-open; winner = official PTB)"
+            ),
+            _ => info!(
+                slug = %market.slug,
+                "window ready (Δ = Binance − official PTB)"
+            ),
+        }
 
         let open_ms = window_open_ms(market.start_ts);
         let end_ms = window_end_ms(market.start_ts);
-        // Gap-swing: do not wait for REST. Reset unlocked; first RTDS 60s TWAP tick locks.
-        let (ptb, _ptb_src) = if matches!(self.cfg.strategy, StrategyKind::GapSwing) {
+        // Gap/venue-swing: do not wait for REST. Reset unlocked; first RTDS TWAP tick locks.
+        let (ptb, _ptb_src) = if matches!(
+            self.cfg.strategy,
+            StrategyKind::GapSwing | StrategyKind::VenueSwing
+        ) {
             (None, "waiting-rtds-twap-sixty")
         } else {
             let mut official = self.ptb_cache.get(&market.start_ts).copied();
@@ -691,11 +822,37 @@ impl Bot {
                 }
                 info!(slug = %market.slug, "window armed — waiting official PTB");
             }
+            ActiveEngine::VenueSwing { engine } => {
+                engine.reset_window(open_ms, end_ms);
+                engine.set_shares(self.cfg.order_shares);
+                let delay = if self.cfg.live_trading {
+                    0
+                } else {
+                    VENUE_TAKER_DELAY_MS
+                };
+                engine.set_taker_delay_ms(delay);
+                self.ptb_locked.store(false, Ordering::Relaxed);
+                // Seed pre-open asks collected while next window was subscribed.
+                let seeded = self.poly_book.history(start_ts);
+                for &(t, up, down) in &seeded {
+                    engine.on_asks(t, up, down);
+                }
+                if let Some(q) = self.poly_book.latest(start_ts) {
+                    engine.on_asks(q.t, q.up_ask, q.down_ask);
+                }
+                info!(
+                    slug = %market.slug,
+                    "window armed — venue opens from BN/CB tapes (PTB only for winner)"
+                );
+            }
         }
         self.pnl.open_window(market.slug.clone(), self.cfg.order_shares);
         self.trading_market = Some(market.clone());
         self.trading_start_ts = Some(start_ts);
-        if matches!(self.cfg.strategy, StrategyKind::GapSwing) {
+        if matches!(
+            self.cfg.strategy,
+            StrategyKind::GapSwing | StrategyKind::VenueSwing
+        ) {
             if let Some((t, px)) = self.last_cl {
                 if t >= open_ms && px > 0.0 {
                     self.try_lock_gap_ptb(start_ts, px, "rtds-twap-sixty").await;
@@ -734,6 +891,12 @@ impl Bot {
                             self.execute_action(&action, &m, now).await;
                         }
                     }
+                    ActiveEngine::VenueSwing { engine } => {
+                        let actions = engine.tick(now, quotes.up_ask, quotes.down_ask);
+                        for action in actions {
+                            self.execute_action(&action, &m, now).await;
+                        }
+                    }
                 }
             }
         }
@@ -751,6 +914,7 @@ impl Bot {
         let ptb = match &self.active {
             ActiveEngine::Pairing { detector, .. } => detector.strike(),
             ActiveEngine::GapSwing { engine } => engine.strike(),
+            ActiveEngine::VenueSwing { engine } => engine.strike(),
         };
 
         let winner = resolve_winner(up_ask, down_ask, last_btc, ptb);
@@ -761,6 +925,10 @@ impl Bot {
             .unwrap_or_else(|| format!("btc-updown-5m-{start_ts}"));
 
         if let ActiveEngine::GapSwing { engine } = &mut self.active {
+            let res = engine.finalize(winner);
+            self.pnl
+                .add_window_net(&slug, res.total_pnl, res.pairs, res.trades.len());
+        } else if let ActiveEngine::VenueSwing { engine } = &mut self.active {
             let res = engine.finalize(winner);
             self.pnl
                 .add_window_net(&slug, res.total_pnl, res.pairs, res.trades.len());
@@ -840,8 +1008,8 @@ impl Bot {
                                 self.cfg.order_shares,
                                 false,
                             );
-                            // Gap-swing commits at intent emit (optimistic Raw lots).
-                            info!("PnL booked {:?} @ actual fill {:.3}", side, fill_px);
+                            // Engine commits at intent emit; actual fill resolves async.
+                            info!("PnL booked {:?} @ intent {:.3}", side, fill_px);
                         }
                     }
                 } else {
@@ -875,8 +1043,8 @@ impl Bot {
                                 self.cfg.order_shares,
                                 true,
                             );
-                            // Gap-swing commits at intent emit (optimistic Raw lots).
-                            info!("PnL booked {:?} @ actual fill {:.3}", side, fill_px);
+                            // Engine commits at intent emit; actual fill resolves async.
+                            info!("PnL booked {:?} @ intent {:.3}", side, fill_px);
                         }
                     }
                 } else {
@@ -906,9 +1074,9 @@ impl Bot {
                         Err(e) => error!("flatten sell failed: {:#}", e),
                         Ok(fill_px) => {
                             self.pnl.record_sell(*side, fill_px, sell_shares);
-                            // Gap-swing commits at intent emit.
+                            // Engine commits at intent emit; actual fill resolves async.
                             info!(
-                                "PnL booked SELL {:?} @ actual fill {:.3} ({:.0} sh)",
+                                "PnL booked SELL {:?} @ intent {:.3} ({:.0} sh)",
                                 side, fill_px, sell_shares
                             );
                         }
@@ -947,9 +1115,10 @@ impl Bot {
     }
 
     fn process_pending_dry(&mut self, now: i64) {
+        let delay = self.dry_delay_ms();
         let mut ready: Vec<PendingDryFill> = vec![];
         self.pending_dry.retain(|p| {
-            if now >= p.send_t + TAKER_DELAY_MS {
+            if now >= p.send_t + delay {
                 ready.push(PendingDryFill {
                     send_t: p.send_t,
                     start_ts: p.start_ts,
@@ -992,7 +1161,7 @@ impl Bot {
     }
 
     fn apply_dry_fill(&mut self, fill: &PendingDryFill, force: bool) {
-        let fill_t = fill.send_t + TAKER_DELAY_MS;
+        let fill_t = fill.send_t + self.dry_delay_ms();
         let fill_px = match fill.kind {
             FillKind::Flatten => fill.worst_ask, // already ask−1¢
             _ => self
@@ -1012,13 +1181,16 @@ impl Bot {
             fill.side,
             self.cfg.order_shares,
             fill_px,
-            TAKER_DELAY_MS,
+            self.dry_delay_ms(),
             fill.reason
         );
 
         if force || self.trading_start_ts == Some(fill.start_ts) {
-            if matches!(self.cfg.strategy, StrategyKind::GapSwing) {
-                // Gap-swing window PnL comes from engine.finalize (same as poly-history).
+            if matches!(
+                self.cfg.strategy,
+                StrategyKind::GapSwing | StrategyKind::VenueSwing
+            ) {
+                // Window PnL comes from engine.finalize (same as poly-history).
                 return;
             }
             match fill.kind {

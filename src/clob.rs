@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
 use alloy::primitives::Address;
@@ -40,11 +41,13 @@ struct PresignedSlot {
     signed: SignedOrder,
 }
 
+type PresignMap = Arc<Mutex<HashMap<String, PresignedSlot>>>;
+
 struct LiveSession {
-    client: Client<Authenticated<Normal>>,
+    client: Arc<Client<Authenticated<Normal>>>,
     signer: PrivateKeySigner,
-    presigned_buys: HashMap<String, PresignedSlot>,
-    presigned_sells: HashMap<String, PresignedSlot>,
+    presigned_buys: PresignMap,
+    presigned_sells: PresignMap,
 }
 
 pub struct OrderClient {
@@ -104,13 +107,13 @@ impl OrderClient {
         auth = auth.signature_type(signature_type_from_cfg(cfg));
 
         let client = auth.authenticate().await.context("clob auth")?;
-        info!("CLOB authenticated — presigned GTC limit orders enabled");
+        info!("CLOB authenticated — presigned GTC limit orders enabled (post-only hot path)");
 
         self.session = Some(LiveSession {
-            client,
+            client: Arc::new(client),
             signer,
-            presigned_buys: HashMap::new(),
-            presigned_sells: HashMap::new(),
+            presigned_buys: Arc::new(Mutex::new(HashMap::new())),
+            presigned_sells: Arc::new(Mutex::new(HashMap::new())),
         });
         Ok(())
     }
@@ -133,7 +136,10 @@ impl OrderClient {
         Ok(())
     }
 
-    /// Posts a GTC buy at `max_limit` (0.99, market-like). Returns **actual fill** for PnL.
+    /// Posts a presigned GTC buy at `max_limit` (0.99, crosses the book like a
+    /// market buy). Returns immediately after the post; fill resolution, remainder
+    /// cancel and presign replenish all run in a background task so the signal
+    /// hot path is a single HTTP POST.
     pub async fn buy_side(
         &mut self,
         market: &MarketInfo,
@@ -163,11 +169,22 @@ impl OrderClient {
             .context("live session not initialized — call init_live()")?;
 
         let shares = self.shares;
-        let max_limit = self.max_limit;
 
-        let signed = match session.presigned_buys.remove(&token_id) {
-            Some(slot) if (slot.limit_px - limit_px).abs() < 1e-9 => slot.signed,
-            _ => {
+        let presigned = {
+            let mut buys = session.presigned_buys.lock().unwrap();
+            match buys.remove(&token_id) {
+                Some(slot) if (slot.limit_px - limit_px).abs() < 1e-9 => Some(slot.signed),
+                Some(slot) => {
+                    buys.insert(token_id.clone(), slot);
+                    None
+                }
+                None => None,
+            }
+        };
+        let signed = match presigned {
+            Some(signed) => signed,
+            None => {
+                warn!("no presigned buy for token — signing inline (slower)");
                 presign_limit_order(
                     &session.client,
                     &session.signer,
@@ -180,6 +197,7 @@ impl OrderClient {
             }
         };
 
+        // Hot path ends here: one HTTP POST with a presigned order.
         let resp = session.client.post_order(signed).await.context("post order")?;
         if !resp.success {
             return Err(anyhow!(
@@ -188,49 +206,27 @@ impl OrderClient {
             ));
         }
 
-        let fill_px = resolve_actual_fill(&session.client, &resp, &token_id, shares).await?;
-        let _ = session.client.cancel_order(&resp.order_id).await;
-
         warn!(
-            "[LIVE] GTC BUY {:?} {:.0}sh limit={:.3} fill={:.3} intent={:.3} reason={} order_id={} status={:?}",
-            side,
-            shares,
-            limit_px,
-            fill_px,
-            intent_px,
-            reason,
-            resp.order_id,
-            resp.status
+            "[LIVE] GTC BUY posted {:?} {:.0}sh limit={:.2} intent={:.3} reason={} order_id={} status={:?}",
+            side, shares, limit_px, intent_px, reason, resp.order_id, resp.status
         );
 
-        if let Ok(signed) = presign_limit_order(
-            &session.client,
-            &session.signer,
-            &token_id,
+        spawn_post_trade_task(
+            session,
+            resp,
+            token_id,
             shares,
-            max_limit,
+            limit_px,
             SdkSide::Buy,
-        )
-        .await
-        {
-            session.presigned_buys.insert(
-                token_id,
-                PresignedSlot {
-                    limit_px: max_limit,
-                    signed,
-                },
-            );
-        } else {
-            warn!(
-                "presign buy replenish {} failed",
-                token_id.chars().take(12).collect::<String>()
-            );
-        }
+            side,
+        );
 
-        Ok(fill_px)
+        Ok(intent_px)
     }
 
-    /// Posts a GTC sell at `min_sell` (0.01, market-like). Returns **actual fill** for PnL.
+    /// Posts a presigned GTC sell at `min_sell` (0.01, crosses the book like a
+    /// market sell). Returns immediately after the post; fill resolution, cancel
+    /// and presign replenish run in a background task.
     pub async fn sell_side(
         &mut self,
         market: &MarketInfo,
@@ -257,11 +253,24 @@ impl OrderClient {
             .as_mut()
             .context("live session not initialized — call init_live()")?;
 
-        let min_sell = self.min_sell;
-
-        let signed = match session.presigned_sells.remove(&token_id) {
-            Some(slot) if (slot.limit_px - limit_px).abs() < 1e-9 => slot.signed,
-            _ => {
+        let size_matches = (shares - self.shares).abs() < 1e-9;
+        let presigned = {
+            let mut sells = session.presigned_sells.lock().unwrap();
+            match sells.remove(&token_id) {
+                Some(slot) if size_matches && (slot.limit_px - limit_px).abs() < 1e-9 => {
+                    Some(slot.signed)
+                }
+                Some(slot) => {
+                    sells.insert(token_id.clone(), slot);
+                    None
+                }
+                None => None,
+            }
+        };
+        let signed = match presigned {
+            Some(signed) => signed,
+            None => {
+                warn!("no presigned sell for token — signing inline (slower)");
                 presign_limit_order(
                     &session.client,
                     &session.signer,
@@ -274,6 +283,7 @@ impl OrderClient {
             }
         };
 
+        // Hot path ends here: one HTTP POST with a presigned order.
         let resp = session.client.post_order(signed).await.context("post sell")?;
         if !resp.success {
             return Err(anyhow!(
@@ -282,46 +292,22 @@ impl OrderClient {
             ));
         }
 
-        let fill_px = resolve_actual_fill(&session.client, &resp, &token_id, shares).await?;
-        let _ = session.client.cancel_order(&resp.order_id).await;
-
         warn!(
-            "[LIVE] GTC SELL {:?} {:.0}sh limit={:.3} fill={:.3} intent={:.3} reason={} order_id={} status={:?}",
-            side,
-            shares,
-            limit_px,
-            fill_px,
-            intent_px,
-            reason,
-            resp.order_id,
-            resp.status
+            "[LIVE] GTC SELL posted {:?} {:.0}sh limit={:.2} intent={:.3} reason={} order_id={} status={:?}",
+            side, shares, limit_px, intent_px, reason, resp.order_id, resp.status
         );
 
-        if let Ok(signed) = presign_limit_order(
-            &session.client,
-            &session.signer,
-            &token_id,
-            self.shares,
-            min_sell,
+        spawn_post_trade_task(
+            session,
+            resp,
+            token_id,
+            shares,
+            limit_px,
             SdkSide::Sell,
-        )
-        .await
-        {
-            session.presigned_sells.insert(
-                token_id,
-                PresignedSlot {
-                    limit_px: min_sell,
-                    signed,
-                },
-            );
-        } else {
-            warn!(
-                "presign sell replenish {} failed",
-                token_id.chars().take(12).collect::<String>()
-            );
-        }
+            side,
+        );
 
-        Ok(fill_px)
+        Ok(intent_px)
     }
 
     async fn presign_buy_token(&mut self, token_id: &str, limit_px: f64) -> Result<()> {
@@ -338,10 +324,11 @@ impl OrderClient {
             SdkSide::Buy,
         )
         .await?;
-        session.presigned_buys.insert(
-            token_id.to_string(),
-            PresignedSlot { limit_px, signed },
-        );
+        session
+            .presigned_buys
+            .lock()
+            .unwrap()
+            .insert(token_id.to_string(), PresignedSlot { limit_px, signed });
         Ok(())
     }
 
@@ -359,12 +346,63 @@ impl OrderClient {
             SdkSide::Sell,
         )
         .await?;
-        session.presigned_sells.insert(
-            token_id.to_string(),
-            PresignedSlot { limit_px, signed },
-        );
+        session
+            .presigned_sells
+            .lock()
+            .unwrap()
+            .insert(token_id.to_string(), PresignedSlot { limit_px, signed });
         Ok(())
     }
+}
+
+/// Off-hot-path follow-up after a post: resolve the actual fill (logging/audit),
+/// cancel any unfilled remainder resting at the aggressive limit, and re-presign
+/// a fresh order so the next signal stays post-only.
+fn spawn_post_trade_task(
+    session: &LiveSession,
+    resp: PostOrderResponse,
+    token_id: String,
+    shares: f64,
+    limit_px: f64,
+    sdk_side: SdkSide,
+    pos_side: PositionSide,
+) {
+    let client = session.client.clone();
+    let signer = session.signer.clone();
+    let map = if matches!(sdk_side, SdkSide::Buy) {
+        session.presigned_buys.clone()
+    } else {
+        session.presigned_sells.clone()
+    };
+    tokio::spawn(async move {
+        let order_id = resp.order_id.clone();
+        match resolve_actual_fill(&client, &resp, &token_id, shares).await {
+            Ok(px) => warn!(
+                "[LIVE] {:?} {:?} actual fill={:.3} order_id={}",
+                sdk_side, pos_side, px, order_id
+            ),
+            Err(e) => warn!(
+                "[LIVE] {:?} {:?} fill resolution failed order_id={}: {:#}",
+                sdk_side, pos_side, order_id, e
+            ),
+        }
+        // Cancel any remainder still resting at the aggressive limit.
+        let _ = client.cancel_order(&order_id).await;
+
+        match presign_limit_order(&client, &signer, &token_id, shares, limit_px, sdk_side).await {
+            Ok(signed) => {
+                map.lock()
+                    .unwrap()
+                    .insert(token_id, PresignedSlot { limit_px, signed });
+            }
+            Err(e) => warn!(
+                "presign replenish {:?} {} failed: {:#}",
+                sdk_side,
+                token_id.chars().take(12).collect::<String>(),
+                e
+            ),
+        }
+    });
 }
 
 async fn presign_limit_order(

@@ -4,8 +4,11 @@ use anyhow::{bail, Context, Result};
 pub enum StrategyKind {
     /// Historical pairing (impulse START + pullback + pair exit).
     Pairing,
-    /// Poly-history best PnL gap-swing (peak→DOWN / trough→UP + pair + T−25s flatten).
+    /// PTB gap-swing (Δ = Binance − official PTB; peak→DOWN / trough→UP).
     GapSwing,
+    /// Venue swing — best verified (~+$4.2k / 7d @ 10 sh, t+70ms). Separate
+    /// BN−BN-open and CB−CB-open zigzags union-merged; winner still PTB.
+    VenueSwing,
 }
 
 impl StrategyKind {
@@ -13,7 +16,8 @@ impl StrategyKind {
         match s.trim().to_ascii_lowercase().as_str() {
             "pairing" | "pair" => Ok(Self::Pairing),
             "gap_swing" | "gap-swing" | "gapswing" | "gap" | "swing" => Ok(Self::GapSwing),
-            other => bail!("unknown STRATEGY={other} (use pairing | gap_swing)"),
+            "venue_swing" | "venue-swing" | "venueswing" | "venue" => Ok(Self::VenueSwing),
+            other => bail!("unknown STRATEGY={other} (use pairing | gap_swing | venue_swing)"),
         }
     }
 
@@ -21,6 +25,7 @@ impl StrategyKind {
         match self {
             Self::Pairing => "pairing",
             Self::GapSwing => "gap_swing",
+            Self::VenueSwing => "venue_swing",
         }
     }
 }
@@ -41,7 +46,7 @@ pub struct Config {
 impl Config {
     pub fn from_env() -> Result<Self> {
         let live_trading = env_bool("LIVE_TRADING", false);
-        let strategy = StrategyKind::parse(env_opt("STRATEGY").as_deref().unwrap_or("gap_swing"))?;
+        let strategy = StrategyKind::parse(env_opt("STRATEGY").as_deref().unwrap_or("venue_swing"))?;
         Ok(Self {
             live_trading,
             strategy,

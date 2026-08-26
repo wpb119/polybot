@@ -24,7 +24,10 @@ async fn main() -> Result<()> {
                 "BTC BN+CB impulse, pullback entry, pair exit"
             }
             polybot::config::StrategyKind::GapSwing => {
-                "poly-history best PnL: peak→DOWN / trough→UP, pair net≥0, flatten T−25s"
+                "PTB gap-swing: Δ=Binance−PTB, peak→DOWN / trough→UP, pair net≥0, flatten T−25s"
+            }
+            polybot::config::StrategyKind::VenueSwing => {
+                "VENUE SWING (best, ~+$4.2k/7d@10sh): BN−BNopen + CB−CBopen zigzags union-merged; winner still PTB"
             }
         }
     );

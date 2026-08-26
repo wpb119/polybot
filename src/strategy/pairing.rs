@@ -7,7 +7,7 @@ use super::detector::CaptureSignal;
 use super::gates::{other_side_ask, should_skip_gap_time, should_skip_token_trend, CaptureGateInput, Side};
 use super::{
     CHASE_MAE, CHASE_MAE_MS, DEAD_ASK, DEAD_CRITICAL_ASK, DEAD_LEFT_MS, HOLD_MFE, MAX_PAIR_FILL,
-    MAX_TOKEN_ASK, MIN_BOOK_LAG, PULLBACK, PULL_WAIT_MS, TAKER_DELAY_MS,
+    MAX_TOKEN_ASK, MIN_BOOK_LAG, PAIRING_POLY_HISTORY_MS, PULLBACK, PULL_WAIT_MS, TAKER_DELAY_MS,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -89,7 +89,7 @@ impl PairingEngine {
 
     pub fn record_poly(&mut self, t: i64, up: f64, down: f64) {
         self.poly_history.push((t, up, down));
-        let cutoff = t - 10_000;
+        let cutoff = t - PAIRING_POLY_HISTORY_MS;
         while self.poly_history.first().is_some_and(|(pt, _, _)| *pt < cutoff) {
             self.poly_history.remove(0);
         }
@@ -186,11 +186,12 @@ impl PairingEngine {
 
             if obs_ask <= ref_ask - PULLBACK {
                 let buy_t = now_ms + TAKER_DELAY_MS;
+                let fill = self.ask_before(buy_t, side).unwrap_or(obs_ask);
                 self.state = State::Holding {
                     side,
                     entry_t: buy_t,
-                    entry_ask: obs_ask,
-                    peak_ask: obs_ask,
+                    entry_ask: fill,
+                    peak_ask: fill,
                     last_obs_t: now_ms,
                     last_obs_ask: obs_ask,
                 };
@@ -203,11 +204,12 @@ impl PairingEngine {
             }
             if now_ms > deadline {
                 let buy_t = now_ms + TAKER_DELAY_MS;
+                let chase_fill = self.ask_before(t0, side).unwrap_or(obs_ask);
                 self.state = State::Holding {
                     side,
                     entry_t: buy_t,
-                    entry_ask: obs_ask,
-                    peak_ask: obs_ask,
+                    entry_ask: chase_fill,
+                    peak_ask: chase_fill,
                     last_obs_t: now_ms,
                     last_obs_ask: obs_ask,
                 };

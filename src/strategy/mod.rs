@@ -29,13 +29,23 @@ pub const Z_R1: f64 = 1.5;
 pub const MIN_NOW_FRAC: f64 = 0.5;
 pub const MIN_SIGNED_ACC: f64 = -1.5;
 pub const COOLDOWN_MS: i64 = 12_000;
-pub const MAX_CAPTURES: u32 = 3;
+pub const MAX_CAPTURES: u32 = 8;
+
+/// Poly ask history retained in pairing engine (chase MAE + dead window + token trend).
+pub const PAIRING_POLY_HISTORY_MS: i64 = 120_000;
 
 mod detector;
 mod gap_swing;
 mod gates;
 mod pairing;
+mod pairing_replay;
+mod venue_swing;
 
 pub use detector::{CaptureSignal, TrendDetector};
 pub use gap_swing::{run_window as run_gap_swing_window, GapSwingEngine, WindowResult};
 pub use pairing::{BotAction, PairingEngine, PositionSide};
+pub use pairing_replay::{run_pairing_window, PairingWindowResult};
+pub use venue_swing::{
+    run_window as run_venue_swing_window, VenueSwingEngine,
+    TAKER_DELAY_MS as VENUE_TAKER_DELAY_MS,
+};
